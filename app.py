@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-삼립 재고 유통 관리 (클라우드 버전)
+삼립 재고·발주·유통 관리 (클라우드 버전)
 - 호스팅: Streamlit Community Cloud (무료)
 - DB: Supabase PostgreSQL (무료)  →  컴퓨터 꺼도 폰에서 접속 가능
 - 접속 시 비밀번호 입력 필요 (Secrets의 APP_PASSWORD)
@@ -46,7 +46,7 @@ def get_secret(key: str, default: str = "") -> str:
 def check_password() -> bool:
     if st.session_state.get("authenticated"):
         return True
-    st.title("🔒 삼립 무인편의점/마트 재고·발주 관리")
+    st.title("🔒 삼립 무인편의점 재고·발주 관리")
     st.caption("접속 비밀번호를 입력하세요.")
     with st.form("login"):
         pw = st.text_input("비밀번호", type="password")
@@ -146,15 +146,57 @@ def get_engine():
     if not url:
         st.error("DB_URL이 설정되지 않았습니다. Streamlit Cloud의 Secrets를 확인하세요.")
         st.stop()
-    eng = create_engine(url, pool_pre_ping=True)
-    with eng.begin() as c:
-        for stmt in DDL.split(";"):
-            if stmt.strip():
-                c.execute(text(stmt))
-        # 기존 배포 DB 마이그레이션: 신규 컬럼이 없으면 추가
-        c.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS expiry_date TEXT DEFAULT ''"))
-        c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS delivery_day TEXT DEFAULT ''"))
-    return eng
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    # 연결 정보 확인용 (비밀번호는 가려서 표시)
+    try:
+        from sqlalchemy.engine.url import make_url
+        u = make_url(url)
+        masked = f"{u.username}@{u.host}:{u.port}/{u.database}"
+    except Exception:
+        masked = "(URL 형식 해석 실패 — DB_URL 형식 자체가 잘못됨)"
+
+    try:
+        eng = create_engine(url, pool_pre_ping=True,
+                            connect_args={"connect_timeout": 10})
+        with eng.begin() as c:
+            for stmt in DDL.split(";"):
+                if stmt.strip():
+                    c.execute(text(stmt))
+            # 기존 배포 DB 마이그레이션: 신규 컬럼이 없으면 추가
+            c.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS expiry_date TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS delivery_day TEXT DEFAULT ''"))
+        return eng
+    except Exception as e:
+        raw = str(getattr(e, "orig", None) or e)
+        st.error("🚫 데이터베이스 연결 실패 — 아래 진단을 확인하세요.")
+        st.write(f"**현재 설정된 접속 정보**: `{masked}`")
+
+        low = raw.lower()
+        if "password authentication failed" in low or "sasl" in low:
+            st.warning("🔑 **비밀번호 오류**: DB_URL 안의 비밀번호가 틀렸습니다. "
+                       "Supabase → Settings → Database → Reset database password 로 "
+                       "영문+숫자만 있는 새 비밀번호를 만들고, Secrets의 DB_URL에 반영하세요. "
+                       "`[YOUR-PASSWORD]` 대괄호까지 지우고 실제 비밀번호로 바꿔야 합니다.")
+        elif "could not translate host name" in low or "name or service not known" in low:
+            st.warning("🌐 **호스트 주소 오류**: DB_URL의 서버 주소에 오타가 있습니다. "
+                       "Supabase → Connect → Transaction pooler 의 URI를 다시 복사하세요.")
+        elif "network is unreachable" in low or "timeout" in low or "timed out" in low:
+            st.warning("🚧 **접속 불가(IPv6/네트워크)**: 직접 연결 주소(db.xxxx.supabase.co)를 쓰고 있을 가능성이 큽니다. "
+                       "반드시 **Transaction pooler** 주소(...pooler.supabase.com:6543)를 사용하세요. "
+                       "또는 Supabase 프로젝트가 일시정지(Paused) 상태인지 확인하고 Restore 하세요.")
+        elif "tenant or user not found" in low:
+            st.warning("👤 **사용자명 형식 오류**: pooler 접속 시 사용자명은 `postgres`가 아니라 "
+                       "`postgres.프로젝트ID` 형태여야 합니다. Connect 화면의 URI를 그대로 복사하세요.")
+        elif "too many connections" in low or "max client" in low:
+            st.warning("🔌 **연결 수 초과**: 잠시 후 새로고침하거나, Streamlit Cloud에서 Reboot app을 해보세요.")
+        else:
+            st.warning("원인 미분류 오류입니다. 아래 원문 메시지를 확인하세요.")
+
+        with st.expander("오류 원문 보기"):
+            st.code(raw)
+        st.stop()
 
 
 engine = get_engine()
