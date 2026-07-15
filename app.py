@@ -344,6 +344,7 @@ def table_png(df: pd.DataFrame, day_col: str = "납품요일") -> bytes:
     return buf.getvalue()
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def df_transactions(d1=None, d2=None) -> pd.DataFrame:
     q = """
         SELECT t.id, t.tdate AS 날짜, p.name AS 제품명, t.ttype AS 구분,
@@ -366,6 +367,7 @@ def df_transactions(d1=None, d2=None) -> pd.DataFrame:
     return qdf(q, **params)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def df_logs(d1=None, d2=None) -> pd.DataFrame:
     q = ("SELECT log_date AS 변경일자, product_name AS 제품명, field AS 변경항목, "
          "old_value AS 이전값, new_value AS 변경값, changed_at AS 변경시각 FROM change_logs")
@@ -385,6 +387,7 @@ def total_ea(row) -> int:
     return int(row["stock_box"]) * max(int(row["box_qty"]), 1) + int(row["stock_ea"])
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def build_ledger(pid: int = None) -> pd.DataFrame:
     """일자별 수불부: 매일의 입고/출고 합(환산낱개)이 누적되어 오늘 재고에 도달.
     마지막 날의 누적재고가 현재 재고(총낱개환산)와 정확히 일치하도록 기초재고를 역산한다.
@@ -1081,9 +1084,22 @@ elif page == "🏬 납품처 관리(엑셀표)":
             "memo": st.column_config.TextColumn("메모"),
             "note": st.column_config.TextColumn("특이사항"),
         }, key="store_editor")
-    csv_button(grid.rename(columns={"name": "매장명", "location": "납품개소",
-                                    "delivery_day": "납품요일", "phone": "점주전화번호",
-                                    "memo": "메모", "note": "특이사항"}), "납품처", "csv_store")
+    export_df = grid.rename(columns={"name": "매장명", "location": "납품개소",
+                                     "delivery_day": "납품요일", "phone": "점주전화번호",
+                                     "memo": "메모", "note": "특이사항"}).copy()
+    export_df["납품요일"] = export_df["납품요일"].apply(
+        lambda v: ",".join(v) if isinstance(v, list) else ("" if pd.isna(v) else str(v)))
+    c_csv, c_png = st.columns(2)
+    with c_csv:
+        csv_button(export_df, "납품처", "csv_store")
+    with c_png:
+        if not export_df.empty:
+            st.download_button("🖼️ 표 PNG로 저장 (요일 색상 포함)",
+                               data=table_png(export_df.drop(columns=["id"], errors="ignore")),
+                               file_name=f"납품처_{TODAY()}.png", mime="image/png", key="png_store")
+    _legend = "  ".join(f":{c}[**{d}**]" for d, c in
+                        [("월", "red"), ("화", "orange"), ("수", "green"), ("목", "violet"), ("금", "blue")])
+    st.caption("요일 색상: " + _legend + " · 토=청록 / 일=주황 / 매일=회색")
 
     if st.button("💾 저장", type="primary", use_container_width=True):
         old_map = {int(r["id"]): r for _, r in stores.iterrows()} if not stores.empty else {}
