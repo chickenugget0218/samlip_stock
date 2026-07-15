@@ -139,6 +139,15 @@ CREATE TABLE IF NOT EXISTS store_product_qty (
     updated_at TEXT,
     UNIQUE(store_id, product_id)
 );
+CREATE TABLE IF NOT EXISTS stock_snapshots (
+    id SERIAL PRIMARY KEY,
+    sdate TEXT NOT NULL,
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    stock_box INTEGER DEFAULT 0,
+    stock_ea INTEGER DEFAULT 0,
+    total_ea INTEGER DEFAULT 0,
+    UNIQUE(sdate, product_id)
+);
 CREATE TABLE IF NOT EXISTS change_logs (
     id SERIAL PRIMARY KEY,
     log_date TEXT NOT NULL,
@@ -247,8 +256,25 @@ def qdf(sql: str, **params) -> pd.DataFrame:
     return pd.read_sql_query(text(sql), engine, params=params)
 
 
+SNAPSHOT_SQL = """
+INSERT INTO stock_snapshots (sdate, product_id, stock_box, stock_ea, total_ea)
+SELECT :d, id, stock_box, stock_ea, stock_box * GREATEST(box_qty, 1) + stock_ea FROM products
+ON CONFLICT (sdate, product_id)
+DO UPDATE SET stock_box = EXCLUDED.stock_box, stock_ea = EXCLUDED.stock_ea, total_ea = EXCLUDED.total_ea
+"""
+
+
+def snapshot_today():
+    """오늘 날짜의 전 제품 재고를 스냅샷으로 저장 (하루에 한 행, 같은 날은 최신값으로 갱신)"""
+    try:
+        run(SNAPSHOT_SQL, d=TODAY())
+    except Exception:
+        pass  # 스냅샷 실패가 앱 사용을 막지 않도록
+
+
 def clear_cache():
-    """저장 후 조회 캐시 초기화 → 항상 최신 데이터 표시"""
+    """저장 후: 오늘 재고 스냅샷 갱신 + 조회 캐시 초기화 → 항상 최신 데이터 표시"""
+    snapshot_today()
     st.cache_data.clear()
 
 
@@ -281,6 +307,15 @@ def df_products() -> pd.DataFrame:
 @st.cache_data(ttl=20, show_spinner=False)
 def df_stores() -> pd.DataFrame:
     return qdf("SELECT * FROM stores ORDER BY id")
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def df_snapshots() -> pd.DataFrame:
+    return qdf(
+        """SELECT n.sdate AS 날짜, p.name AS 제품명, n.stock_box AS 박스, n.stock_ea AS 낱개,
+                  n.total_ea AS 재고환산낱개
+           FROM stock_snapshots n JOIN products p ON p.id = n.product_id
+           ORDER BY n.sdate, p.name""")
 
 
 def csv_bytes(df: pd.DataFrame) -> bytes:
@@ -318,13 +353,22 @@ def table_png(df: pd.DataFrame, day_col: str = "납품요일") -> bytes:
 
     df = df.fillna("").astype(str)
     n_rows, n_cols = len(df), len(df.columns)
-    fig, ax = plt.subplots(figsize=(max(8, n_cols * 1.7), max(2.2, 0.75 + 0.42 * n_rows)))
+    # 여러 줄 셀(줄바꿈 포함) 대응: 행별 최대 줄 수 계산
+    row_lines = [max(str(v).count("\n") + 1 for v in df.iloc[i]) for i in range(n_rows)]
+    total_lines = sum(row_lines)
+    fig, ax = plt.subplots(figsize=(max(8, n_cols * 1.7), max(2.2, 0.85 + 0.42 * total_lines)))
     ax.axis("off")
     tbl = ax.table(cellText=df.values, colLabels=df.columns, loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(10)
     tbl.scale(1, 1.5)
     tbl.auto_set_column_width(col=list(range(n_cols)))
+    # 줄 수에 비례해 행 높이 확장
+    for i in range(1, n_rows + 1):
+        if row_lines[i - 1] > 1:
+            for j in range(n_cols):
+                cell = tbl[i, j]
+                cell.set_height(cell.get_height() * row_lines[i - 1] * 0.9)
     # 헤더 스타일
     for j in range(n_cols):
         tbl[0, j].set_facecolor("#37474F")
@@ -479,6 +523,11 @@ def build_excel(d1=None, d2=None) -> bytes:
 # ──────────────────────────────────────────────
 # 사이드바 메뉴
 # ──────────────────────────────────────────────
+# 접속 시 오늘 재고 스냅샷 자동 저장 (세션당 1회)
+if not st.session_state.get("snapshot_done"):
+    snapshot_today()
+    st.session_state["snapshot_done"] = True
+
 st.sidebar.title("📦 삼립 무인편의점 재고관리")
 page = st.sidebar.radio(
     "메뉴",
@@ -546,18 +595,36 @@ if page == "📊 대시보드":
             st.warning(f"⏰ 소비기한 30일 이내(경과 포함) {len(soon)}건")
             st.dataframe(soon, use_container_width=True, hide_index=True)
 
-    st.subheader("현재 재고 현황")
+    st.subheader("재고 현황")
     if prods.empty:
         st.info("등록된 제품이 없습니다. [제품 관리] 메뉴에서 제품을 추가하세요.")
     else:
-        view = prods.copy()
-        view["총낱개환산"] = view.apply(total_ea, axis=1)
-        view = view[["name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                     "storage", "delivery_ea", "stock_box", "stock_ea", "총낱개환산"]]
-        view.columns = ["제품명", "바코드", "구분", "박스입수량", "규격(무게)", "정상가", "할인판매가",
-                        "보관방법", "납품갯수(낱개)", "재고(박스)", "재고(낱개)", "총낱개환산"]
-        st.dataframe(view, use_container_width=True, hide_index=True)
-        csv_button(view, "재고현황", "csv_dash")
+        tab_now, tab_trend = st.tabs(["📋 현재 재고 현황", "📈 일자별 재고 추세 (자동 저장)"])
+        with tab_now:
+            view = prods.copy()
+            view["총낱개환산"] = view.apply(total_ea, axis=1)
+            view = view[["name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
+                         "storage", "delivery_ea", "stock_box", "stock_ea", "총낱개환산"]]
+            view.columns = ["제품명", "바코드", "구분", "박스입수량", "규격(무게)", "정상가", "할인판매가",
+                            "보관방법", "납품갯수(낱개)", "재고(박스)", "재고(낱개)", "총낱개환산"]
+            st.dataframe(view, use_container_width=True, hide_index=True)
+            csv_button(view, "재고현황", "csv_dash")
+        with tab_trend:
+            snaps = df_snapshots()
+            if snaps.empty:
+                st.info("접속·저장할 때마다 그날의 재고가 자동 기록됩니다. 내일부터 추세가 그려집니다.")
+            else:
+                opts = sorted(snaps["제품명"].unique())
+                pick = st.multiselect("표시할 제품", opts, default=opts[:min(5, len(opts))],
+                                      key="snap_pick")
+                if pick:
+                    sub = snaps[snaps["제품명"].isin(pick)]
+                    chart = sub.pivot_table(index="날짜", columns="제품명",
+                                            values="재고환산낱개", aggfunc="last")
+                    st.line_chart(chart)
+                    st.caption("제품 관리(엑셀표)에서 수정한 재고를 포함해, 매일의 마지막 재고 상태가 날짜별로 자동 저장됩니다. "
+                               "세로축 = 재고(총낱개환산).")
+                    csv_button(sub, "재고추세", "csv_snap")
 
     st.subheader("오늘 기록")
     st.dataframe(tx_today.drop(columns=["id"]), use_container_width=True, hide_index=True)
@@ -1148,7 +1215,7 @@ elif page == "🏬 납품처 관리(엑셀표)":
         st.rerun()
 
     st.divider()
-    st.subheader("매장별 납품 제품 조회")
+    st.subheader("매장별 납품 제품 조회 — 제품명 묶음(피벗)")
     ps = qdf(
         """SELECT s.name AS 매장명, s.location AS 납품개소, s.delivery_day AS 납품요일,
                   s.phone AS 점주전화번호, p.name AS 제품명
@@ -1156,8 +1223,34 @@ elif page == "🏬 납품처 관리(엑셀표)":
            JOIN stores s ON s.id = x.store_id
            JOIN products p ON p.id = x.product_id
            ORDER BY s.name, p.name""")
-    st.dataframe(ps, use_container_width=True, hide_index=True)
-    csv_button(ps, "매장별납품제품", "csv_ps")
+    if ps.empty:
+        st.info("제품 관리 상세에서 제품별 납품 매장을 지정하면 여기에 표시됩니다.")
+    else:
+        grouped = (ps.groupby(["매장명", "납품개소", "납품요일", "점주전화번호"], dropna=False)["제품명"]
+                     .agg(lambda s: ", ".join(s)).reset_index()
+                     .rename(columns={"제품명": "납품 제품"}))
+        grouped.insert(1, "제품수", grouped["납품 제품"].apply(lambda v: v.count(",") + 1 if v else 0))
+        grouped = grouped[["매장명", "납품요일", "제품수", "납품 제품", "납품개소", "점주전화번호"]]
+        st.dataframe(grouped, use_container_width=True, hide_index=True,
+                     column_config={"납품 제품": st.column_config.TextColumn("납품 제품", width="large")})
+
+        c_csv2, c_png2 = st.columns(2)
+        with c_csv2:
+            csv_button(grouped, "매장별납품제품_묶음", "csv_ps_group")
+        with c_png2:
+            # PNG용: 긴 제품 목록은 줄바꿈 처리
+            import textwrap
+            png_df = grouped.copy()
+            png_df["납품 제품"] = png_df["납품 제품"].apply(
+                lambda v: "\n".join(textwrap.wrap(str(v), width=38)) or "")
+            st.download_button("🖼️ 묶음표 PNG로 저장 (요일 색상 포함)",
+                               data=table_png(png_df),
+                               file_name=f"매장별납품제품_{TODAY()}.png", mime="image/png",
+                               key="png_ps_group")
+
+        with st.expander("행별 상세 보기 (매장×제품 1행씩)"):
+            st.dataframe(ps, use_container_width=True, hide_index=True)
+            csv_button(ps, "매장별납품제품_상세", "csv_ps")
 
 
 # ══════════════════════════════════════════════
