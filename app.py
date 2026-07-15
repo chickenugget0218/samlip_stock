@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-아람비즈 재고·발주·유통 관리 (클라우드 버전)
+삼립 재고·발주·유통 관리 (클라우드 버전)
 - 호스팅: Streamlit Community Cloud (무료)
 - DB: Supabase PostgreSQL (무료)  →  컴퓨터 꺼도 폰에서 접속 가능
 - 접속 시 비밀번호 입력 필요 (Secrets의 APP_PASSWORD)
@@ -17,17 +17,25 @@ from datetime import datetime, date
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
+from zoneinfo import ZoneInfo
 
 # ──────────────────────────────────────────────
-# 기본 설정
+# 기본 설정 — 모든 날짜/시간은 한국시간(KST) 기준
 # ──────────────────────────────────────────────
-KST_NOW = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-TODAY = lambda: date.today().strftime("%Y-%m-%d")
+KST = ZoneInfo("Asia/Seoul")
+KST_NOW = lambda: datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+TODAY = lambda: datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def today_kst() -> date:
+    return datetime.now(KST).date()
 
 STORAGE_OPTIONS = ["상온", "냉장", "냉동"]
 NEW_OLD_OPTIONS = ["신규", "기존"]
 TTYPE_OPTIONS = ["입고", "출고", "발주"]
 DAY_OPTIONS = ["월", "화", "수", "목", "금", "토", "일", "매일"]
+DAY_COLORS = ["#FF6B6B", "#FFD93D", "#6BCB77", "#B983FF", "#4D96FF", "#00C2CB", "#FF9F45", "#9E9E9E"]  # 월~일·매일
+DAY_COLOR_MAP = dict(zip(DAY_OPTIONS, DAY_COLORS))
 KOR_WEEKDAY = ["월", "화", "수", "목", "금", "토", "일"]  # date.weekday() 매핑
 
 st.set_page_config(page_title="삼립 무인편의점 재고·발주", page_icon="📦", layout="wide")
@@ -99,7 +107,9 @@ CREATE TABLE IF NOT EXISTS stores (
     name TEXT NOT NULL UNIQUE,
     location TEXT DEFAULT '',
     delivery_day TEXT DEFAULT '',
-    memo TEXT DEFAULT ''
+    phone TEXT DEFAULT '',
+    memo TEXT DEFAULT '',
+    note TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS product_stores (
     id SERIAL PRIMARY KEY,
@@ -169,6 +179,10 @@ def get_engine():
             c.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS expiry_date TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS delivery_day TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''"))
         return eng
     except Exception as e:
         raw = str(getattr(e, "orig", None) or e)
@@ -279,6 +293,57 @@ def csv_button(df: pd.DataFrame, name: str, key: str):
                        file_name=f"{name}_{TODAY()}.csv", mime="text/csv", key=key)
 
 
+def _lighten(hex_color: str, ratio: float = 0.72) -> str:
+    """셀 배경용으로 색을 밝게 (흰색과 혼합)"""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
+    mix = lambda c: int(c + (255 - c) * ratio)
+    return f"#{mix(r):02X}{mix(g):02X}{mix(b):02X}"
+
+
+def table_png(df: pd.DataFrame, day_col: str = "납품요일") -> bytes:
+    """표를 PNG 이미지로 렌더링. 납품요일 셀은 요일별 색상(월/수/금 등 각각 다름)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+    # 한글 폰트 (Streamlit Cloud: packages.txt에 fonts-nanum 필요)
+    for fp in ("/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+               "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"):
+        if os.path.exists(fp):
+            font_manager.fontManager.addfont(fp)
+            plt.rcParams["font.family"] = font_manager.FontProperties(fname=fp).get_name()
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+    df = df.fillna("").astype(str)
+    n_rows, n_cols = len(df), len(df.columns)
+    fig, ax = plt.subplots(figsize=(max(8, n_cols * 1.7), max(2.2, 0.75 + 0.42 * n_rows)))
+    ax.axis("off")
+    tbl = ax.table(cellText=df.values, colLabels=df.columns, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 1.5)
+    tbl.auto_set_column_width(col=list(range(n_cols)))
+    # 헤더 스타일
+    for j in range(n_cols):
+        tbl[0, j].set_facecolor("#37474F")
+        tbl[0, j].get_text().set_color("white")
+        tbl[0, j].get_text().set_weight("bold")
+    # 요일 셀 색상 (여러 요일이면 첫 요일 기준 배경 + 전체 텍스트 표시)
+    if day_col in df.columns:
+        j = list(df.columns).index(day_col)
+        for i, v in enumerate(df[day_col].tolist(), start=1):
+            first = str(v).split(",")[0].strip()
+            if first in DAY_COLOR_MAP:
+                tbl[i, j].set_facecolor(_lighten(DAY_COLOR_MAP[first]))
+                tbl[i, j].get_text().set_weight("bold")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def df_transactions(d1=None, d2=None) -> pd.DataFrame:
     q = """
         SELECT t.id, t.tdate AS 날짜, p.name AS 제품명, t.ttype AS 구분,
@@ -379,7 +444,8 @@ def build_excel(d1=None, d2=None) -> bytes:
     tx = df_transactions(d1, d2).drop(columns=["id"], errors="ignore")
     logs = df_logs(d1, d2)
     stores = df_stores().rename(columns={"name": "매장명", "location": "납품개소",
-                                         "delivery_day": "납품요일", "memo": "메모"})
+                                         "delivery_day": "납품요일", "phone": "점주전화번호",
+                                         "memo": "메모", "note": "특이사항"})
     if "id" in stores.columns:
         stores = stores.drop(columns=["id"])
     items = qdf(
@@ -410,7 +476,7 @@ def build_excel(d1=None, d2=None) -> bytes:
 # ──────────────────────────────────────────────
 # 사이드바 메뉴
 # ──────────────────────────────────────────────
-st.sidebar.title("📦 삼립 무인편의점")
+st.sidebar.title("📦 삼립 무인편의점 재고관리")
 page = st.sidebar.radio(
     "메뉴",
     ["📊 대시보드", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "📜 변경이력", "⬇️ 엑셀 내보내기"],
@@ -438,7 +504,7 @@ if page == "📊 대시보드":
     c4.metric("오늘 발주", f"{len(tx_today[tx_today['구분']=='발주'])}건")
 
     # 오늘 요일에 납품 나가는 매장 (다중 요일 "화,금" 형식 지원)
-    today_day = KOR_WEEKDAY[date.today().weekday()]
+    today_day = KOR_WEEKDAY[today_kst().weekday()]
     stores_all = df_stores()
     if not stores_all.empty:
         def _due(s):
@@ -468,7 +534,7 @@ if page == "📊 대시보드":
            ORDER BY t.expiry_date""")
     if not exp.empty:
         from datetime import timedelta
-        limit = (date.today() + timedelta(days=30)).strftime("%Y-%m-%d")
+        limit = (today_kst() + timedelta(days=30)).strftime("%Y-%m-%d")
         soon = exp[exp["소비기한"] <= limit]
         if not soon.empty:
             passed = soon[soon["소비기한"] < TODAY()]
@@ -507,81 +573,191 @@ elif page == "📝 일일 기록":
     if prods.empty:
         st.warning("먼저 [제품 관리]에서 제품을 등록하세요.")
     else:
-        c1, c2, c3 = st.columns(3)
-        tdate = c1.date_input("날짜", value=date.today())
-        pname = c2.selectbox("제품", prods["name"].tolist())
-        ttype = c3.radio("구분", TTYPE_OPTIONS, horizontal=True)
+        mode_daily = st.radio(
+            "입력 방식",
+            ["1️⃣ 단일 입력 (실시간 환산 표시)", "🧾 여러 제품 일괄 입력 (엑셀형 · 발주서 CSV)"],
+            horizontal=True, label_visibility="collapsed")
 
-        prow = prods[prods["name"] == pname].iloc[0]
-        box_qty = max(int(prow["box_qty"]), 1)
+        # ═══ 모드 1: 단일 입력 ═══
+        if mode_daily.startswith("1️⃣"):
+            c1, c2, c3 = st.columns(3)
+            tdate = c1.date_input("날짜", value=today_kst())
+            pname = c2.selectbox("제품", prods["name"].tolist())
+            ttype = c3.radio("구분", TTYPE_OPTIONS, horizontal=True)
 
-        c4, c5, c6, c7 = st.columns([1.2, 1, 1, 1.2])
-        store_names = ["(총량 / 매장 미지정)"] + stores["name"].tolist()
-        sname = c4.selectbox("매장(납품처)", store_names,
-                             help="매장별로 나눌 필요 없으면 '(총량)'을 선택")
-        qty_box = c5.number_input("수량(박스)", min_value=0, step=1, value=0, key="in_box",
-                                  help="박스만 입력해도 됩니다 → 낱개로 자동 환산")
-        qty_ea = c6.number_input("수량(낱개)", min_value=0, step=1, value=0, key="in_ea",
-                                 help="낱개만 입력해도 됩니다")
+            prow = prods[prods["name"] == pname].iloc[0]
+            box_qty = max(int(prow["box_qty"]), 1)
 
-        # ── 실시간 환산 표시 (박스 입력 → 낱개 자동 계산) ──
-        conv = int(qty_box) * box_qty + int(qty_ea)
-        with c7:
-            st.metric("환산 낱개(자동)", f"{conv:,}개",
-                      help=f"'{pname}' 1박스 = {box_qty}낱개 기준 자동 계산")
-        if qty_box and qty_ea:
-            st.caption(f"↳ 박스 {qty_box} × {box_qty}낱개 + 낱개 {qty_ea} = **{conv:,}낱개**")
-        elif qty_box:
-            st.caption(f"↳ 박스 {qty_box} × {box_qty}낱개 = **{conv:,}낱개** (박스만 입력됨)")
-        elif qty_ea:
-            st.caption(f"↳ 낱개 {qty_ea}개 (낱개만 입력됨)")
+            c4, c5, c6, c7 = st.columns([1.2, 1, 1, 1.2])
+            store_names = ["(총량 / 매장 미지정)"] + stores["name"].tolist()
+            sname = c4.selectbox("매장(납품처)", store_names,
+                                 help="매장별로 나눌 필요 없으면 '(총량)'을 선택")
+            qty_box = c5.number_input("수량(박스)", min_value=0, step=1, value=0, key="in_box",
+                                      help="박스만 입력해도 됩니다 → 낱개로 자동 환산")
+            qty_ea = c6.number_input("수량(낱개)", min_value=0, step=1, value=0, key="in_ea",
+                                     help="낱개만 입력해도 됩니다")
 
-        c8, c9 = st.columns([1, 2])
-        exp_use = c8.checkbox("소비기한 입력", help="물건이 들어올 때(입고) 소비기한을 기록")
-        exp_date = c8.date_input("소비기한", value=date.today(), label_visibility="collapsed")
-        memo = c9.text_input("메모", placeholder="예: 국군복지단 정기 납품 / 로트번호 등")
-        ok = st.button("💾 기록 저장", use_container_width=True, type="primary")
+            # ── 실시간 환산 표시 (박스 입력 → 낱개 자동 계산) ──
+            conv = int(qty_box) * box_qty + int(qty_ea)
+            with c7:
+                st.metric("환산 낱개(자동)", f"{conv:,}개",
+                          help=f"'{pname}' 1박스 = {box_qty}낱개 기준 자동 계산")
+            if qty_box and qty_ea:
+                st.caption(f"↳ 박스 {qty_box} × {box_qty}낱개 + 낱개 {qty_ea} = **{conv:,}낱개**")
+            elif qty_box:
+                st.caption(f"↳ 박스 {qty_box} × {box_qty}낱개 = **{conv:,}낱개** (박스만 입력됨)")
+            elif qty_ea:
+                st.caption(f"↳ 낱개 {qty_ea}개 (낱개만 입력됨)")
 
-        if ok:
-            if qty_box == 0 and qty_ea == 0:
-                st.error("박스 또는 낱개 수량 중 하나 이상을 입력하세요.")
+            c8, c9 = st.columns([1, 2])
+            exp_use = c8.checkbox("소비기한 입력", help="물건이 들어올 때(입고) 소비기한을 기록")
+            exp_date = c8.date_input("소비기한", value=today_kst(), label_visibility="collapsed")
+            memo = c9.text_input("메모", placeholder="예: 국군복지단 정기 납품 / 로트번호 등")
+            ok = st.button("💾 기록 저장", use_container_width=True, type="primary")
+
+            if ok:
+                if qty_box == 0 and qty_ea == 0:
+                    st.error("박스 또는 낱개 수량 중 하나 이상을 입력하세요.")
+                else:
+                    pid = int(prow["id"])
+                    sid = None
+                    if sname != "(총량 / 매장 미지정)":
+                        sid = int(stores[stores["name"] == sname].iloc[0]["id"])
+                    ops = [(
+                        "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, expiry_date, memo, created_at) "
+                        "VALUES (:d, :p, :t, :s, :qb, :qe, :ex, :m, :c)",
+                        dict(d=tdate.strftime("%Y-%m-%d"), p=pid, t=ttype, s=sid,
+                             qb=int(qty_box), qe=int(qty_ea),
+                             ex=exp_date.strftime("%Y-%m-%d") if exp_use else "",
+                             m=memo, c=KST_NOW()))]
+                    if ttype in ("입고", "출고"):
+                        sign = 1 if ttype == "입고" else -1
+                        new_box = int(prow["stock_box"]) + sign * int(qty_box)
+                        new_ea = int(prow["stock_ea"]) + sign * int(qty_ea)
+                        while new_ea < 0 and new_box > 0:
+                            new_box -= 1
+                            new_ea += box_qty
+                        ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
+                                    dict(b=new_box, e=new_ea, u=KST_NOW(), i=pid)))
+                        ops.append(log_op(pname, "stock_box" if qty_box else "stock_ea",
+                                          f"박스 {prow['stock_box']} / 낱개 {prow['stock_ea']}",
+                                          f"박스 {new_box} / 낱개 {new_ea} ({ttype} {qty_box}박스 {qty_ea}낱개 = 환산 {conv}낱개)"))
+                    run_batch(ops)  # 한 번의 트랜잭션으로 저장
+                    clear_cache()
+                    # 수량 입력칸 초기화
+                    for k in ("in_box", "in_ea"):
+                        st.session_state.pop(k, None)
+                    st.success(f"✅ {tdate} · {pname} · {ttype} · 환산 {conv:,}낱개 기록 완료")
+                    st.rerun()
+
+
+        # ═══ 모드 2: 여러 제품 일괄 입력 (엑셀형) → 발주서 CSV ═══
+        else:
+            st.caption("아래 표에 행을 추가하며 여러 제품을 한 번에 입력하세요. 저장 전에도 [발주서 CSV]로 내보내 발주 담당자에게 전달할 수 있습니다.")
+            bdate = st.date_input("날짜 (모든 행에 일괄 적용)", value=today_kst(), key="bulk_date")
+
+            store_opts = ["(총량 / 매장 미지정)"] + stores["name"].tolist()
+            bulk_empty = pd.DataFrame({
+                "제품명": pd.Series(dtype="object"),
+                "구분": pd.Series(dtype="object"),
+                "매장": pd.Series(dtype="object"),
+                "박스": pd.Series(dtype="Int64"),
+                "낱개": pd.Series(dtype="Int64"),
+                "소비기한": pd.Series(dtype="datetime64[ns]"),
+                "메모": pd.Series(dtype="object"),
+            })
+            edited_b = st.data_editor(
+                bulk_empty, num_rows="dynamic", hide_index=True, use_container_width=True,
+                column_config={
+                    "제품명": st.column_config.SelectboxColumn("제품명", options=prods["name"].tolist(), required=True),
+                    "구분": st.column_config.SelectboxColumn("구분", options=TTYPE_OPTIONS, default="발주"),
+                    "매장": st.column_config.SelectboxColumn("매장(납품처)", options=store_opts, default="(총량 / 매장 미지정)"),
+                    "박스": st.column_config.NumberColumn("수량(박스)", min_value=0, step=1, default=0),
+                    "낱개": st.column_config.NumberColumn("수량(낱개)", min_value=0, step=1, default=0),
+                    "소비기한": st.column_config.DateColumn("소비기한(선택)", format="YYYY-MM-DD"),
+                    "메모": st.column_config.TextColumn("메모"),
+                }, key="daily_bulk_editor")
+
+            valid = edited_b[edited_b["제품명"].notna()].copy()
+            if valid.empty:
+                st.info("표에 제품을 추가하면 발주서 CSV 내보내기와 일괄 저장 버튼이 나타납니다.")
             else:
-                pid = int(prow["id"])
-                sid = None
-                if sname != "(총량 / 매장 미지정)":
-                    sid = int(stores[stores["name"] == sname].iloc[0]["id"])
-                ops = [(
-                    "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, expiry_date, memo, created_at) "
-                    "VALUES (:d, :p, :t, :s, :qb, :qe, :ex, :m, :c)",
-                    dict(d=tdate.strftime("%Y-%m-%d"), p=pid, t=ttype, s=sid,
-                         qb=int(qty_box), qe=int(qty_ea),
-                         ex=exp_date.strftime("%Y-%m-%d") if exp_use else "",
-                         m=memo, c=KST_NOW()))]
-                if ttype in ("입고", "출고"):
-                    sign = 1 if ttype == "입고" else -1
-                    new_box = int(prow["stock_box"]) + sign * int(qty_box)
-                    new_ea = int(prow["stock_ea"]) + sign * int(qty_ea)
-                    while new_ea < 0 and new_box > 0:
-                        new_box -= 1
-                        new_ea += box_qty
-                    ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
-                                dict(b=new_box, e=new_ea, u=KST_NOW(), i=pid)))
-                    ops.append(log_op(pname, "stock_box" if qty_box else "stock_ea",
-                                      f"박스 {prow['stock_box']} / 낱개 {prow['stock_ea']}",
-                                      f"박스 {new_box} / 낱개 {new_ea} ({ttype} {qty_box}박스 {qty_ea}낱개 = 환산 {conv}낱개)"))
-                run_batch(ops)  # 한 번의 트랜잭션으로 저장
-                clear_cache()
-                # 수량 입력칸 초기화
-                for k in ("in_box", "in_ea"):
-                    st.session_state.pop(k, None)
-                st.success(f"✅ {tdate} · {pname} · {ttype} · 환산 {conv:,}낱개 기록 완료")
-                st.rerun()
+                valid["박스"] = valid["박스"].fillna(0).astype(int)
+                valid["낱개"] = valid["낱개"].fillna(0).astype(int)
+                valid["구분"] = valid["구분"].fillna("발주")
+                valid["매장"] = valid["매장"].fillna("(총량 / 매장 미지정)")
+                valid["메모"] = valid["메모"].fillna("")
+
+                # ── 발주서 CSV: 상품 정보(바코드·가격·박스입수량) 포함 ──
+                info = prods[["name", "barcode", "box_qty", "normal_price", "sale_price"]].rename(
+                    columns={"name": "제품명", "barcode": "바코드", "box_qty": "박스입수량",
+                             "normal_price": "정상가", "sale_price": "할인판매가"})
+                order = valid.merge(info, on="제품명", how="left")
+                order["날짜"] = bdate.strftime("%Y-%m-%d")
+                order["환산낱개"] = order["박스"] * order["박스입수량"].clip(lower=1) + order["낱개"]
+                order["소비기한"] = order["소비기한"].apply(
+                    lambda v: "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d"))
+                order = order[["날짜", "구분", "매장", "제품명", "바코드", "박스입수량",
+                               "정상가", "할인판매가", "박스", "낱개", "환산낱개", "소비기한", "메모"]]
+                order.columns = ["날짜", "구분", "매장", "제품명", "바코드", "박스입수량",
+                                 "정상가", "할인판매가", "수량(박스)", "수량(낱개)", "환산낱개", "소비기한", "메모"]
+
+                c_dl, c_sv = st.columns(2)
+                with c_dl:
+                    st.download_button(
+                        "📤 발주서 CSV 내보내기 (담당자 전달용)",
+                        data=csv_bytes(order),
+                        file_name=f"발주서_{bdate.strftime('%Y-%m-%d')}.csv",
+                        mime="text/csv", use_container_width=True, key="order_csv")
+                with c_sv:
+                    do_save = st.button(f"💾 {len(valid)}건 일괄 저장", type="primary",
+                                        use_container_width=True, key="bulk_save")
+
+                if do_save:
+                    bad = valid[(valid["박스"] == 0) & (valid["낱개"] == 0)]
+                    if not bad.empty:
+                        st.error(f"수량이 0인 행이 {len(bad)}건 있습니다. 박스 또는 낱개를 입력하세요.")
+                    else:
+                        sid_map = dict(zip(stores["name"], stores["id"]))
+                        prow_map = {r["name"]: r for _, r in prods.iterrows()}
+                        ops = []
+                        stock_delta = {}  # pid → 환산낱개 변화 합 (입고+, 출고-)
+                        for _, r in valid.iterrows():
+                            pr = prow_map[r["제품명"]]
+                            pid = int(pr["id"])
+                            sid = sid_map.get(r["매장"]) if r["매장"] in sid_map else None
+                            ex = "" if pd.isna(r["소비기한"]) else pd.Timestamp(r["소비기한"]).strftime("%Y-%m-%d")
+                            ops.append((
+                                "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, expiry_date, memo, created_at) "
+                                "VALUES (:d, :p, :t, :s, :qb, :qe, :ex, :m, :c)",
+                                dict(d=bdate.strftime("%Y-%m-%d"), p=pid, t=r["구분"],
+                                     s=int(sid) if sid is not None else None,
+                                     qb=int(r["박스"]), qe=int(r["낱개"]), ex=ex, m=r["메모"], c=KST_NOW())))
+                            if r["구분"] in ("입고", "출고"):
+                                sign = 1 if r["구분"] == "입고" else -1
+                                bq = max(int(pr["box_qty"]), 1)
+                                stock_delta[pid] = stock_delta.get(pid, 0) + sign * (int(r["박스"]) * bq + int(r["낱개"]))
+                        # 제품별 재고 일괄 반영 (환산낱개 → 박스/낱개 재배분)
+                        for pid, delta in stock_delta.items():
+                            pr = next(p for p in prow_map.values() if int(p["id"]) == pid)
+                            bq = max(int(pr["box_qty"]), 1)
+                            total = int(pr["stock_box"]) * bq + int(pr["stock_ea"]) + delta
+                            new_box, new_ea = (total // bq, total % bq) if total >= 0 else (0, total)
+                            ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
+                                        dict(b=new_box, e=new_ea, u=KST_NOW(), i=pid)))
+                            ops.append(log_op(pr["name"], "stock_box",
+                                              f"박스 {pr['stock_box']} / 낱개 {pr['stock_ea']}",
+                                              f"박스 {new_box} / 낱개 {new_ea} (일괄기록 환산 {'+' if delta>=0 else ''}{delta}낱개)"))
+                        run_batch(ops)
+                        clear_cache()
+                        st.success(f"✅ {bdate.strftime('%Y-%m-%d')} · {len(valid)}건 일괄 저장 완료")
+                        st.rerun()
 
         # ── 일일 기록 엑셀 내보내기 ──
         st.divider()
         c_a, c_b = st.columns([1, 2])
         with c_a:
-            exp_date = st.date_input("내보낼 날짜", value=date.today(), key="daily_exp")
+            exp_date = st.date_input("내보낼 날짜", value=today_kst(), key="daily_exp")
         with c_b:
             st.write("")
             st.write("")
@@ -689,6 +865,22 @@ elif page == "📦 제품 관리(엑셀표)":
     st.caption("셀을 터치/더블클릭해 수정 → [변경사항 저장]. 맨 아래 빈 줄에 입력하면 신규 제품 추가. 수정 내용은 변경이력에 자동 기록됩니다.")
 
     prods = df_products()
+
+    # ── 재고 일별 추세 그래프 (수불부 기반) ──
+    with st.expander("📈 재고 일별 추세 그래프", expanded=True):
+        led = build_ledger()
+        if led.empty or prods.empty:
+            st.info("입고/출고 기록이 쌓이면 일별 재고 추세가 표시됩니다.")
+        else:
+            opts = prods["name"].tolist()
+            _sel = st.session_state.get("detail_prod")
+            default = [_sel] if _sel in opts else opts[:min(5, len(opts))]
+            pick = st.multiselect("표시할 제품 (여러 개 선택 가능)", opts, default=default, key="trend_pick")
+            if pick:
+                sub = led[led["제품명"].isin(pick)]
+                chart = sub.pivot_table(index="날짜", columns="제품명", values="누적재고", aggfunc="last")
+                st.line_chart(chart)
+                st.caption("세로축: 재고(총낱개환산) · 매일의 입고−출고가 누적된 값 · 마지막 점 = 현재 재고")
 
     # ── 아래 상세 드롭다운(담당제품)과 연동되는 표 필터 ──
     sel_detail = st.session_state.get("detail_prod")
@@ -868,7 +1060,7 @@ elif page == "🏬 납품처 관리(엑셀표)":
     st.title("🏬 납품처(매장) 관리 — 엑셀처럼 직접 수정")
     st.caption("셀을 터치/더블클릭해 수정하고 [저장]. 맨 아래 빈 줄에 입력하면 신규 매장 추가.")
     stores = df_stores()
-    grid_cols = ["id", "name", "location", "delivery_day", "memo"]
+    grid_cols = ["id", "name", "location", "delivery_day", "phone", "memo", "note"]
     grid = stores[grid_cols].copy() if not stores.empty else pd.DataFrame(columns=grid_cols)
     # DB의 "화,금" 문자열 → 다중선택용 리스트로 변환
     grid["delivery_day"] = grid["delivery_day"].apply(
@@ -883,10 +1075,15 @@ elif page == "🏬 납품처 관리(엑셀표)":
             "delivery_day": st.column_config.MultiselectColumn(
                 "납품요일", options=DAY_OPTIONS,
                 help="이 지점에 물건이 나가는 요일을 모두 선택 (예: 화·금)"),
+            "phone": st.column_config.TextColumn(
+                "점주 전화번호", validate=r"^[0-9\-\s]*$",
+                help="숫자와 하이픈(-)만 입력. 예: 010-1234-5678"),
             "memo": st.column_config.TextColumn("메모"),
+            "note": st.column_config.TextColumn("특이사항"),
         }, key="store_editor")
     csv_button(grid.rename(columns={"name": "매장명", "location": "납품개소",
-                                    "delivery_day": "납품요일", "memo": "메모"}), "납품처", "csv_store")
+                                    "delivery_day": "납품요일", "phone": "점주전화번호",
+                                    "memo": "메모", "note": "특이사항"}), "납품처", "csv_store")
 
     if st.button("💾 저장", type="primary", use_container_width=True):
         old_map = {int(r["id"]): r for _, r in stores.iterrows()} if not stores.empty else {}
@@ -905,23 +1102,25 @@ elif page == "🏬 납품처 관리(엑셀표)":
             else:
                 days = []
             dd = ",".join(sorted(set(days), key=DAY_OPTIONS.index))  # 예: "화,금"
+            ph = "" if pd.isna(r["phone"]) else str(r["phone"]).strip()
             mm = "" if pd.isna(r["memo"]) else str(r["memo"])
+            nt = "" if pd.isna(r["note"]) else str(r["note"])
             if pd.notna(r["id"]) and int(r["id"]) in old_map:
                 rid = int(r["id"]); seen.add(rid)
                 old = old_map[rid]
-                if (old["name"], old["location"], old["delivery_day"], old["memo"]) != (nm, loc, dd, mm):
-                    ops.append(("UPDATE stores SET name=:n, location=:l, delivery_day=:d, memo=:m WHERE id=:i",
-                                dict(n=nm, l=loc, d=dd, m=mm, i=rid)))
+                if (old["name"], old["location"], old["delivery_day"], old["phone"], old["memo"], old["note"]) != (nm, loc, dd, ph, mm, nt):
+                    ops.append(("UPDATE stores SET name=:n, location=:l, delivery_day=:d, phone=:p, memo=:m, note=:nt WHERE id=:i",
+                                dict(n=nm, l=loc, d=dd, p=ph, m=mm, nt=nt, i=rid)))
                     ops.append(log_op(f"[매장] {nm}", "매장정보",
-                                      f"{old['name']} / {old['location']} / {old['delivery_day'] or '요일미지정'}",
-                                      f"{nm} / {loc} / {dd or '요일미지정'}"))
+                                      f"{old['name']} / {old['location']} / {old['delivery_day'] or '요일미지정'} / {old['phone'] or '번호없음'}",
+                                      f"{nm} / {loc} / {dd or '요일미지정'} / {ph or '번호없음'}"))
             else:
                 if nm in existing_store_names:
                     st.warning(f"'{nm}' 매장은 이미 존재합니다.")
                     continue
                 existing_store_names.add(nm)
-                ops.append(("INSERT INTO stores (name, location, delivery_day, memo) VALUES (:n, :l, :d, :m)",
-                            dict(n=nm, l=loc, d=dd, m=mm)))
+                ops.append(("INSERT INTO stores (name, location, delivery_day, phone, memo, note) VALUES (:n, :l, :d, :p, :m, :nt)",
+                            dict(n=nm, l=loc, d=dd, p=ph, m=mm, nt=nt)))
                 ops.append(log_op(f"[매장] {nm}", "매장정보", "(신규등록)", f"{nm} / {loc} / {dd or '요일미지정'}"))
         for rid, old in old_map.items():
             if rid not in seen:
@@ -935,7 +1134,8 @@ elif page == "🏬 납품처 관리(엑셀표)":
     st.divider()
     st.subheader("매장별 납품 제품 조회")
     ps = qdf(
-        """SELECT s.name AS 매장명, s.location AS 납품개소, s.delivery_day AS 납품요일, p.name AS 제품명
+        """SELECT s.name AS 매장명, s.location AS 납품개소, s.delivery_day AS 납품요일,
+                  s.phone AS 점주전화번호, p.name AS 제품명
            FROM product_stores x
            JOIN stores s ON s.id = x.store_id
            JOIN products p ON p.id = x.product_id
@@ -957,69 +1157,141 @@ elif page == "📋 납품 정리표(매장×제품)":
         st.warning("제품과 납품처(매장)를 먼저 등록하세요.")
     else:
         plan = df_plan()
-        grid_cols = ["id", "매장명", "제품명", "박스", "낱개", "메모"]
-        grid = plan[grid_cols].copy() if not plan.empty else pd.DataFrame(columns=grid_cols)
+        mode = st.radio("입력 방식", ["🏬 매장별 일괄 입력 (한 매장에 여러 제품 한 번에)", "✏️ 전체 편집 (행 단위)"],
+                        horizontal=True, label_visibility="collapsed")
 
-        edited = st.data_editor(
-            grid, num_rows="dynamic", hide_index=True, use_container_width=True,
-            disabled=["id"],
-            column_config={
-                "id": st.column_config.NumberColumn("ID", width="small"),
-                "매장명": st.column_config.SelectboxColumn("매장명", options=stores["name"].tolist(), required=True),
-                "제품명": st.column_config.SelectboxColumn("제품명", options=prods["name"].tolist(), required=True),
-                "박스": st.column_config.NumberColumn("수량(박스)", min_value=0, step=1),
-                "낱개": st.column_config.NumberColumn("수량(낱개)", min_value=0, step=1),
-                "메모": st.column_config.TextColumn("메모"),
-            }, key="plan_editor")
-        csv_button(edited, "납품정리표", "csv_plan")
+        # ═══ 모드 A: 매장 하나 선택 → 전체 제품 수량을 한 표에서 입력 ═══
+        if mode.startswith("🏬"):
+            sel_store = st.selectbox("매장 선택", stores["name"].tolist(), key="bulk_store")
+            srow = stores[stores["name"] == sel_store].iloc[0]
+            sid = int(srow["id"])
+            st.caption(f"'{sel_store}' 에 들어갈 제품별 수량을 입력하세요. 0/0에 메모도 없으면 정리표에서 빠집니다."
+                       + (f" (납품요일: {srow['delivery_day']})" if srow["delivery_day"] else ""))
 
-        if st.button("💾 정리표 저장", type="primary", use_container_width=True):
-            sid_map = dict(zip(stores["name"], stores["id"]))
-            pid_map = dict(zip(prods["name"], prods["id"]))
-            old_map = {}
-            if not plan.empty:
-                for _, r in plan.iterrows():
-                    old_map[(r["매장명"], r["제품명"])] = r
+            # 기존 정리표 값 불러와 전체 제품 목록에 병합
+            cur = plan[plan["매장명"] == sel_store][["제품명", "박스", "낱개", "메모"]] if not plan.empty \
+                else pd.DataFrame(columns=["제품명", "박스", "낱개", "메모"])
+            bulk = prods[["name", "box_qty"]].rename(columns={"name": "제품명", "box_qty": "박스입수량"}).copy()
+            bulk = bulk.merge(cur, on="제품명", how="left")
+            bulk["박스"] = bulk["박스"].fillna(0).astype(int)
+            bulk["낱개"] = bulk["낱개"].fillna(0).astype(int)
+            bulk["메모"] = bulk["메모"].fillna("")
+            bulk["환산낱개"] = bulk["박스"] * bulk["박스입수량"].clip(lower=1) + bulk["낱개"]
 
-            new_keys, changes, ops = set(), 0, []
-            for _, r in edited.iterrows():
-                if pd.isna(r["매장명"]) or pd.isna(r["제품명"]):
-                    continue
-                sname, pname = str(r["매장명"]), str(r["제품명"])
-                if sname not in sid_map or pname not in pid_map:
-                    continue
-                key = (sname, pname)
-                if key in new_keys:
-                    st.warning(f"'{sname} × {pname}' 이 중복 입력되어 첫 행만 저장했습니다.")
-                    continue
-                new_keys.add(key)
-                qb = int(r["박스"]) if pd.notna(r["박스"]) else 0
-                qe = int(r["낱개"]) if pd.notna(r["낱개"]) else 0
-                mm = "" if pd.isna(r["메모"]) else str(r["메모"])
-                old = old_map.get(key)
-                if old is None or (int(old["박스"]), int(old["낱개"]), str(old["메모"])) != (qb, qe, mm):
-                    ops.append(("""INSERT INTO store_product_qty (store_id, product_id, qty_box, qty_ea, memo, updated_at)
-                           VALUES (:s, :p, :qb, :qe, :m, :u)
-                           ON CONFLICT (store_id, product_id)
-                           DO UPDATE SET qty_box=:qb, qty_ea=:qe, memo=:m, updated_at=:u""",
-                        dict(s=int(sid_map[sname]), p=int(pid_map[pname]),
-                             qb=qb, qe=qe, m=mm, u=KST_NOW())))
-                    ops.append(log_op(f"[정리표] {sname} × {pname}", "납품수량",
-                                      "(신규)" if old is None else f"박스 {old['박스']} / 낱개 {old['낱개']}",
-                                      f"박스 {qb} / 낱개 {qe}"))
-                    changes += 1
+            bulk_edit = st.data_editor(
+                bulk, hide_index=True, use_container_width=True,
+                disabled=["제품명", "박스입수량", "환산낱개"],
+                column_config={
+                    "제품명": st.column_config.TextColumn("제품명"),
+                    "박스입수량": st.column_config.NumberColumn("박스입수량", width="small"),
+                    "박스": st.column_config.NumberColumn("수량(박스)", min_value=0, step=1),
+                    "낱개": st.column_config.NumberColumn("수량(낱개)", min_value=0, step=1),
+                    "환산낱개": st.column_config.NumberColumn("환산낱개(저장시 계산)", width="small"),
+                    "메모": st.column_config.TextColumn("메모"),
+                }, key=f"bulk_editor_{sid}")
 
-            for key, old in old_map.items():
-                if key not in new_keys:
-                    ops.append(("DELETE FROM store_product_qty WHERE id=:i", {"i": int(old["id"])}))
-                    ops.append(log_op(f"[정리표] {key[0]} × {key[1]}", "납품수량",
-                                      f"박스 {old['박스']} / 낱개 {old['낱개']}", "(삭제됨)"))
-                    changes += 1
+            c_save, c_csv = st.columns([2, 1])
+            with c_csv:
+                csv_button(bulk_edit.drop(columns=["환산낱개"]), f"정리표_{sel_store}", "csv_bulk")
+            with c_save:
+                if st.button(f"💾 '{sel_store}' 정리표 저장", type="primary", use_container_width=True):
+                    pid_map = dict(zip(prods["name"], prods["id"]))
+                    old_map = {r["제품명"]: r for _, r in cur.iterrows()}
+                    ops, changes = [], 0
+                    for _, r in bulk_edit.iterrows():
+                        pname = r["제품명"]
+                        qb = int(r["박스"]) if pd.notna(r["박스"]) else 0
+                        qe = int(r["낱개"]) if pd.notna(r["낱개"]) else 0
+                        mm = "" if pd.isna(r["메모"]) else str(r["메모"])
+                        old = old_map.get(pname)
+                        if qb == 0 and qe == 0 and not mm:
+                            if old is not None:  # 기존 항목 → 제거
+                                ops.append(("DELETE FROM store_product_qty WHERE store_id=:s AND product_id=:p",
+                                            dict(s=sid, p=int(pid_map[pname]))))
+                                ops.append(log_op(f"[정리표] {sel_store} × {pname}", "납품수량",
+                                                  f"박스 {old['박스']} / 낱개 {old['낱개']}", "(삭제됨)"))
+                                changes += 1
+                            continue
+                        if old is None or (int(old["박스"]), int(old["낱개"]), str(old["메모"])) != (qb, qe, mm):
+                            ops.append(("""INSERT INTO store_product_qty (store_id, product_id, qty_box, qty_ea, memo, updated_at)
+                                   VALUES (:s, :p, :qb, :qe, :m, :u)
+                                   ON CONFLICT (store_id, product_id)
+                                   DO UPDATE SET qty_box=:qb, qty_ea=:qe, memo=:m, updated_at=:u""",
+                                        dict(s=sid, p=int(pid_map[pname]), qb=qb, qe=qe, m=mm, u=KST_NOW())))
+                            ops.append(log_op(f"[정리표] {sel_store} × {pname}", "납품수량",
+                                              "(신규)" if old is None else f"박스 {old['박스']} / 낱개 {old['낱개']}",
+                                              f"박스 {qb} / 낱개 {qe}"))
+                            changes += 1
+                    run_batch(ops)
+                    clear_cache()
+                    st.success(f"✅ '{sel_store}' 정리표 저장 완료 — 변경 {changes}건")
+                    st.rerun()
 
-            run_batch(ops)
-            clear_cache()
-            st.success(f"✅ 정리표 저장 완료 — 변경 {changes}건 기록")
-            st.rerun()
+        # ═══ 모드 B: 기존 행 단위 전체 편집 ═══
+        else:
+            grid_cols = ["id", "매장명", "제품명", "박스", "낱개", "메모"]
+            grid = plan[grid_cols].copy() if not plan.empty else pd.DataFrame(columns=grid_cols)
+
+            edited = st.data_editor(
+                grid, num_rows="dynamic", hide_index=True, use_container_width=True,
+                disabled=["id"],
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", width="small"),
+                    "매장명": st.column_config.SelectboxColumn("매장명", options=stores["name"].tolist(), required=True),
+                    "제품명": st.column_config.SelectboxColumn("제품명", options=prods["name"].tolist(), required=True),
+                    "박스": st.column_config.NumberColumn("수량(박스)", min_value=0, step=1),
+                    "낱개": st.column_config.NumberColumn("수량(낱개)", min_value=0, step=1),
+                    "메모": st.column_config.TextColumn("메모"),
+                }, key="plan_editor")
+            csv_button(edited, "납품정리표", "csv_plan")
+
+            if st.button("💾 정리표 저장", type="primary", use_container_width=True):
+                sid_map = dict(zip(stores["name"], stores["id"]))
+                pid_map = dict(zip(prods["name"], prods["id"]))
+                old_map = {}
+                if not plan.empty:
+                    for _, r in plan.iterrows():
+                        old_map[(r["매장명"], r["제품명"])] = r
+
+                new_keys, changes, ops = set(), 0, []
+                for _, r in edited.iterrows():
+                    if pd.isna(r["매장명"]) or pd.isna(r["제품명"]):
+                        continue
+                    sname, pname = str(r["매장명"]), str(r["제품명"])
+                    if sname not in sid_map or pname not in pid_map:
+                        continue
+                    key = (sname, pname)
+                    if key in new_keys:
+                        st.warning(f"'{sname} × {pname}' 이 중복 입력되어 첫 행만 저장했습니다.")
+                        continue
+                    new_keys.add(key)
+                    qb = int(r["박스"]) if pd.notna(r["박스"]) else 0
+                    qe = int(r["낱개"]) if pd.notna(r["낱개"]) else 0
+                    mm = "" if pd.isna(r["메모"]) else str(r["메모"])
+                    old = old_map.get(key)
+                    if old is None or (int(old["박스"]), int(old["낱개"]), str(old["메모"])) != (qb, qe, mm):
+                        ops.append(("""INSERT INTO store_product_qty (store_id, product_id, qty_box, qty_ea, memo, updated_at)
+                               VALUES (:s, :p, :qb, :qe, :m, :u)
+                               ON CONFLICT (store_id, product_id)
+                               DO UPDATE SET qty_box=:qb, qty_ea=:qe, memo=:m, updated_at=:u""",
+                            dict(s=int(sid_map[sname]), p=int(pid_map[pname]),
+                                 qb=qb, qe=qe, m=mm, u=KST_NOW())))
+                        ops.append(log_op(f"[정리표] {sname} × {pname}", "납품수량",
+                                          "(신규)" if old is None else f"박스 {old['박스']} / 낱개 {old['낱개']}",
+                                          f"박스 {qb} / 낱개 {qe}"))
+                        changes += 1
+
+                for key, old in old_map.items():
+                    if key not in new_keys:
+                        ops.append(("DELETE FROM store_product_qty WHERE id=:i", {"i": int(old["id"])}))
+                        ops.append(log_op(f"[정리표] {key[0]} × {key[1]}", "납품수량",
+                                          f"박스 {old['박스']} / 낱개 {old['낱개']}", "(삭제됨)"))
+                        changes += 1
+
+                run_batch(ops)
+                clear_cache()
+                st.success(f"✅ 정리표 저장 완료 — 변경 {changes}건 기록")
+                st.rerun()
 
         # ── 조회 ──
         st.divider()
@@ -1051,8 +1323,8 @@ elif page == "📋 납품 정리표(매장×제품)":
 elif page == "📜 변경이력":
     st.title("📜 변경이력 (날짜별 자동 기록)")
     c1, c2 = st.columns(2)
-    d1 = c1.date_input("시작일", value=date.today().replace(day=1))
-    d2 = c2.date_input("종료일", value=date.today())
+    d1 = c1.date_input("시작일", value=today_kst().replace(day=1))
+    d2 = c2.date_input("종료일", value=today_kst())
     logs = df_logs(d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d"))
     st.dataframe(logs, use_container_width=True, hide_index=True)
     st.caption(f"총 {len(logs)}건")
@@ -1072,8 +1344,8 @@ elif page == "⬇️ 엑셀 내보내기":
         d1 = d2 = TODAY()
     elif scope == "기간 지정":
         c1, c2 = st.columns(2)
-        d1 = c1.date_input("시작일", value=date.today().replace(day=1)).strftime("%Y-%m-%d")
-        d2 = c2.date_input("종료일", value=date.today()).strftime("%Y-%m-%d")
+        d1 = c1.date_input("시작일", value=today_kst().replace(day=1)).strftime("%Y-%m-%d")
+        d2 = c2.date_input("종료일", value=today_kst()).strftime("%Y-%m-%d")
 
     st.download_button("📥 엑셀 다운로드", data=build_excel(d1, d2),
                        file_name=f"재고관리_{TODAY()}.xlsx",
