@@ -156,6 +156,13 @@ CREATE TABLE IF NOT EXISTS stock_snapshots (
     total_ea INTEGER DEFAULT 0,
     UNIQUE(sdate, product_id)
 );
+CREATE TABLE IF NOT EXISTS daily_memos (
+    id SERIAL PRIMARY KEY,
+    mdate TEXT NOT NULL UNIQUE,   -- 날짜당 메모 1건
+    content TEXT DEFAULT '',
+    created_at TEXT,
+    updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS change_logs (
     id SERIAL PRIMARY KEY,
     log_date TEXT NOT NULL,
@@ -367,6 +374,17 @@ def expiry_breakdown() -> pd.DataFrame:
                                  박스환산=f"{left // bq}박스 {left % bq}낱개",
                                  디데이=dday))
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def df_memos(d1=None, d2=None) -> pd.DataFrame:
+    q = "SELECT mdate AS 날짜, content AS 메모, updated_at AS 수정시각 FROM daily_memos"
+    cond, params = [], {}
+    if d1: cond.append("mdate >= :d1"); params["d1"] = d1
+    if d2: cond.append("mdate <= :d2"); params["d2"] = d2
+    if cond: q += " WHERE " + " AND ".join(cond)
+    q += " ORDER BY mdate DESC"
+    return qdf(q, **params)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -609,6 +627,8 @@ def build_excel(d1=None, d2=None) -> bytes:
         (items if not items.empty else pd.DataFrame({"안내": ["구성품 없음"]})).to_excel(writer, sheet_name="구성품", index=False)
         (plan if not plan.empty else pd.DataFrame({"안내": ["정리표 없음"]})).to_excel(writer, sheet_name="납품정리표", index=False)
         (ledger if not ledger.empty else pd.DataFrame({"안내": ["수불부 없음"]})).to_excel(writer, sheet_name="수불부", index=False)
+        memos_all = df_memos(d1, d2)
+        (memos_all if not memos_all.empty else pd.DataFrame({"안내": ["메모 없음"]})).to_excel(writer, sheet_name="일자메모", index=False)
         for ws in writer.book.worksheets:
             for col in ws.columns:
                 width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
@@ -1564,6 +1584,54 @@ elif page == "📋 납품 정리표(매장×제품)":
                                        aggfunc="sum", fill_value=0)
                 st.caption("행=제품, 열=매장, 값=수량(박스)")
                 st.dataframe(mat, use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+# 일자별 메모 — 독립 테이블(daily_memos), 날짜당 1건
+# ══════════════════════════════════════════════
+elif page == "🗒️ 일자별 메모":
+    st.title("🗒️ 일자별 메모")
+    st.caption("재고·발주와 별개로 그날그날 남기는 업무 메모입니다. 날짜당 한 건이며, 같은 날 다시 저장하면 덮어씁니다.")
+
+    mdate = st.date_input("날짜", value=today_kst(), key="memo_date")
+    mkey = mdate.strftime("%Y-%m-%d")
+    cur = qdf("SELECT content FROM daily_memos WHERE mdate = :d", d=mkey)
+    cur_text = cur.iloc[0]["content"] if not cur.empty else ""
+
+    content = st.text_area("메모 내용", value=cur_text, height=220, key=f"memo_{mkey}",
+                           placeholder="예) 가산점 점주 통화 — 다음주 화요일 물량 2배 요청 / 냉동차 예약 완료")
+
+    c_save, c_del = st.columns([3, 1])
+    with c_save:
+        if st.button("💾 메모 저장", type="primary", use_container_width=True, key="memo_save"):
+            run("""INSERT INTO daily_memos (mdate, content, created_at, updated_at)
+                   VALUES (:d, :c, :t, :t)
+                   ON CONFLICT (mdate) DO UPDATE SET content = :c, updated_at = :t""",
+                d=mkey, c=content, t=KST_NOW())
+            clear_cache()
+            st.success(f"✅ {mkey} 메모 저장 완료")
+            st.rerun()
+    with c_del:
+        if st.button("🗑️ 이 날짜 삭제", use_container_width=True, key="memo_del",
+                     disabled=cur.empty):
+            run("DELETE FROM daily_memos WHERE mdate = :d", d=mkey)
+            clear_cache()
+            st.success(f"{mkey} 메모 삭제 완료")
+            st.rerun()
+
+    st.divider()
+    st.subheader("메모 목록")
+    c1, c2 = st.columns(2)
+    d1 = c1.date_input("시작일", value=today_kst().replace(day=1), key="memo_d1")
+    d2 = c2.date_input("종료일", value=today_kst(), key="memo_d2")
+    memos = df_memos(d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d"))
+    if memos.empty:
+        st.info("이 기간에 저장된 메모가 없습니다.")
+    else:
+        st.dataframe(memos, use_container_width=True, hide_index=True,
+                     column_config={"메모": st.column_config.TextColumn("메모", width="large")})
+        csv_button(memos, "일자별메모", "csv_memos")
+
 
 
 # ══════════════════════════════════════════════
