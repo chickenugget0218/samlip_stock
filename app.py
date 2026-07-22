@@ -90,9 +90,11 @@ CREATE TABLE IF NOT EXISTS products (
     stock_box INTEGER DEFAULT 0,
     stock_ea INTEGER DEFAULT 0,
     safety_box INTEGER DEFAULT 0,
+    safety_ea INTEGER DEFAULT 0,
     image_name TEXT DEFAULT '',
     image_data BYTEA,
     memo TEXT DEFAULT '',
+    safety_ea INTEGER DEFAULT 0,
     created_at TEXT,
     updated_at TEXT DEFAULT ''
 );
@@ -138,6 +140,12 @@ CREATE TABLE IF NOT EXISTS store_product_qty (
     memo TEXT DEFAULT '',
     updated_at TEXT,
     UNIQUE(store_id, product_id)
+);
+CREATE TABLE IF NOT EXISTS daily_notes (
+    id SERIAL PRIMARY KEY,
+    ndate TEXT NOT NULL UNIQUE,
+    content TEXT DEFAULT '',
+    updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS stock_snapshots (
     id SERIAL PRIMARY KEY,
@@ -188,10 +196,16 @@ def get_engine():
             c.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS expiry_date TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS delivery_day TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
+            c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
+            c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
+            c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
         return eng
     except Exception as e:
         raw = str(getattr(e, "orig", None) or e)
@@ -286,7 +300,7 @@ FIELD_LABELS = {
     "delivery_ea": "납품갯수(낱개)",
     "normal_price": "정상가", "sale_price": "할인판매가", "storage": "보관방법",
     "is_new": "신규/기존", "stock_box": "현재고(박스)", "stock_ea": "현재고(낱개)",
-    "safety_box": "안전재고(박스)", "memo": "메모", "image_name": "이미지", "updated_at": "저장시각",
+    "safety_box": "안전재고(박스)", "safety_ea": "안전재고(낱개환산)", "memo": "메모", "image_name": "이미지", "updated_at": "저장시각",
 }
 
 
@@ -300,13 +314,59 @@ def df_products() -> pd.DataFrame:
     # image_data(용량 큼)는 제외하고 조회 / 20초 캐싱으로 화면 전환 속도 개선
     return qdf(
         "SELECT id, name, barcode, box_qty, spec, normal_price, sale_price, storage, "
-        "is_new, delivery_ea, stock_box, stock_ea, safety_box, image_name, memo, created_at, updated_at "
+        "is_new, delivery_ea, stock_box, stock_ea, safety_box, safety_ea, image_name, memo, created_at, updated_at "
         "FROM products ORDER BY id")
 
 
 @st.cache_data(ttl=20, show_spinner=False)
 def df_stores() -> pd.DataFrame:
     return qdf("SELECT * FROM stores ORDER BY id")
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def expiry_breakdown() -> pd.DataFrame:
+    """제품별 · 소비기한별 잔여 낱개 계산.
+    입고 로트(소비기한별 환산낱개)에서 총출고량을 기한 빠른 순(FIFO)으로 차감한 잔여를 반환.
+    ※ 입출고 '기록' 기준이므로, 제품 관리에서 재고를 수동 조정한 분은 로트에 반영되지 않음."""
+    lots = qdf("""
+        SELECT p.id AS pid, p.name AS 제품명, p.box_qty,
+               t.expiry_date AS 소비기한,
+               SUM(t.qty_box * GREATEST(p.box_qty,1) + t.qty_ea) AS 입고낱개
+        FROM transactions t JOIN products p ON p.id = t.product_id
+        WHERE t.ttype = '입고'
+        GROUP BY p.id, p.name, p.box_qty, t.expiry_date""")
+    outs = qdf("""
+        SELECT product_id AS pid,
+               SUM(t.qty_box * GREATEST(p.box_qty,1) + t.qty_ea) AS 출고낱개
+        FROM transactions t JOIN products p ON p.id = t.product_id
+        WHERE t.ttype = '출고' GROUP BY product_id""")
+    if lots.empty:
+        return pd.DataFrame()
+    out_map = dict(zip(outs["pid"], outs["출고낱개"])) if not outs.empty else {}
+    rows = []
+    for pid, g in lots.groupby("pid"):
+        # 기한 있는 로트를 빠른 날짜순으로 먼저, 기한 없는 로트는 마지막에 차감
+        g = g.copy()
+        g["_ord"] = g["소비기한"].apply(lambda v: v if v else "9999-99-99")
+        g = g.sort_values("_ord")
+        remain_out = int(out_map.get(pid, 0))
+        for _, r in g.iterrows():
+            qty = int(r["입고낱개"])
+            used = min(qty, remain_out)
+            remain_out -= used
+            left = qty - used
+            if left > 0:
+                bq = max(int(r["box_qty"]), 1)
+                exp = r["소비기한"] or "(기한없음)"
+                dday = ""
+                if r["소비기한"]:
+                    dd = (pd.Timestamp(r["소비기한"]).date() - today_kst()).days
+                    dday = f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY")
+                rows.append(dict(제품명=r["제품명"], 소비기한=exp,
+                                 잔여낱개환산=left,
+                                 박스환산=f"{left // bq}박스 {left % bq}낱개",
+                                 디데이=dday))
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -427,8 +487,44 @@ def df_logs(d1=None, d2=None) -> pd.DataFrame:
     return qdf(q, **params)
 
 
+def fmt_stock(box, ea, box_qty) -> str:
+    """재고를 박스 단위로 자동 정규화해 표시 (보기 전용, 저장값은 그대로).
+    예: 박스입수량 12, 재고 낱개 75 → '6박스 3낱개'"""
+    bq = max(int(box_qty), 1)
+    total = int(box) * bq + int(ea)
+    if total < 0:
+        return f"{total}낱개(음수)"
+    return f"{total // bq}박스 {total % bq}낱개"
+
+
+def safety_mark(total: int, safety) -> str:
+    """안전재고 대비 상태: 🟢 충족 / 🔴 부족 / ⚪ 미설정"""
+    s = int(safety) if pd.notna(safety) else 0
+    if s <= 0:
+        return "⚪"
+    return "🟢" if total >= s else "🔴"
+
+
 def total_ea(row) -> int:
     return int(row["stock_box"]) * max(int(row["box_qty"]), 1) + int(row["stock_ea"])
+
+
+def normalize_stock(box: int, ea: int, box_qty: int):
+    """낱개가 박스입수량 이상이면 박스로 자동 변환. 예) 입수량12, 낱개30 → 박스+2 낱개6"""
+    bq = max(int(box_qty), 1)
+    total = int(box) * bq + int(ea)
+    if total >= 0:
+        return total // bq, total % bq
+    return 0, total  # 음수 재고는 낱개에 표시
+
+
+def normalize_stock(box: int, ea: int, box_qty: int):
+    """낱개가 박스입수량 이상이면 박스로 자동 환산 (예: 입수량 12, 낱개 50 → 박스 +4, 낱개 2)"""
+    bq = max(int(box_qty), 1)
+    total = int(box) * bq + int(ea)
+    if total < 0:
+        return int(box), int(ea)
+    return total // bq, total % bq
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -484,9 +580,9 @@ def build_excel(d1=None, d2=None) -> bytes:
         prods = prods.copy()
         prods["총낱개환산"] = prods.apply(total_ea, axis=1)
         prods = prods[["name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                       "storage", "delivery_ea", "stock_box", "stock_ea", "총낱개환산", "memo", "updated_at"]]
+                       "storage", "delivery_ea", "stock_box", "stock_ea", "총낱개환산", "safety_ea", "memo", "updated_at"]]
         prods.columns = ["제품명", "바코드", "구분", "박스입수량", "규격(무게)", "정상가", "할인판매가",
-                         "보관방법", "납품갯수(낱개)", "재고(박스)", "재고(낱개)", "총낱개환산", "메모", "저장시각"]
+                         "보관방법", "납품갯수(낱개)", "재고(박스)", "재고(낱개)", "총낱개환산", "안전재고(낱개환산)", "메모", "저장시각"]
 
     tx = df_transactions(d1, d2).drop(columns=["id"], errors="ignore")
     logs = df_logs(d1, d2)
@@ -531,7 +627,7 @@ if not st.session_state.get("snapshot_done"):
 st.sidebar.title("📦 삼립 무인편의점 재고관리")
 page = st.sidebar.radio(
     "메뉴",
-    ["📊 대시보드", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "📜 변경이력", "⬇️ 엑셀 내보내기"],
+    ["📊 대시보드", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"],
     label_visibility="collapsed",
 )
 st.sidebar.caption(f"오늘: {TODAY()}")
@@ -568,13 +664,15 @@ if page == "📊 대시보드":
                     + ", ".join(due["name"].tolist()))
 
     if not prods.empty:
-        low = prods[prods["stock_box"] <= prods["safety_box"]]
+        _p = prods.copy()
+        _p["총낱개환산"] = _p.apply(total_ea, axis=1)
+        low = _p[(_p["safety_ea"] > 0) & (_p["총낱개환산"] < _p["safety_ea"])]
         if not low.empty:
-            st.error(f"⚠️ 안전재고 이하 제품 {len(low)}개 — 발주 검토 필요")
+            st.error(f"⚠️ 안전재고 미달 제품 {len(low)}개 — 발주 검토 필요")
             st.dataframe(
-                low[["name", "stock_box", "stock_ea", "safety_box"]].rename(columns={
-                    "name": "제품명", "stock_box": "현재고(박스)",
-                    "stock_ea": "현재고(낱개)", "safety_box": "안전재고(박스)"}),
+                low[["name", "stock_box", "stock_ea", "총낱개환산", "safety_ea"]].rename(columns={
+                    "name": "제품명", "stock_box": "현재고(박스)", "stock_ea": "현재고(낱개)",
+                    "safety_ea": "안전재고(낱개환산)"}),
                 use_container_width=True, hide_index=True)
 
     # 소비기한 임박 경고 (입고 기록 기준, 30일 이내)
@@ -595,6 +693,25 @@ if page == "📊 대시보드":
             st.warning(f"⏰ 소비기한 30일 이내(경과 포함) {len(soon)}건")
             st.dataframe(soon, use_container_width=True, hide_index=True)
 
+    # 소비기한별 잔여 수량 분해 (입고 로트 기준, 출고는 기한 빠른 순 차감)
+    bd = expiry_breakdown()
+    if not bd.empty:
+        with st.expander("📦 소비기한별 잔여 수량 — 어떤 기한의 낱개가 몇 개 남았는지", expanded=True):
+            def _hl_exp(row):
+                exp = row["소비기한"]
+                if exp != "(기한없음)":
+                    dd = (pd.Timestamp(exp).date() - today_kst()).days
+                    if dd < 0:
+                        return ["background-color: #FFEBEE"] * len(row)   # 경과: 연빨강
+                    if dd <= 30:
+                        return ["background-color: #FFF8E1"] * len(row)   # 임박: 연노랑
+                return [""] * len(row)
+            st.dataframe(bd.style.apply(_hl_exp, axis=1),
+                         use_container_width=True, hide_index=True)
+            csv_button(bd, "소비기한별잔여", "csv_expiry_bd")
+            st.caption("입고 시 기록한 소비기한 로트에서 출고량을 기한 빠른 순으로 차감한 잔여입니다. "
+                       "재고를 표에서 직접 수정한 분은 로트에 반영되지 않습니다.")
+
     st.subheader("재고 현황")
     if prods.empty:
         st.info("등록된 제품이 없습니다. [제품 관리] 메뉴에서 제품을 추가하세요.")
@@ -604,10 +721,20 @@ if page == "📊 대시보드":
             view = prods.copy()
             view["총낱개환산"] = view.apply(total_ea, axis=1)
             view = view[["name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                         "storage", "delivery_ea", "stock_box", "stock_ea", "총낱개환산"]]
+                         "storage", "delivery_ea", "stock_box", "stock_ea", "총낱개환산", "safety_ea"]]
             view.columns = ["제품명", "바코드", "구분", "박스입수량", "규격(무게)", "정상가", "할인판매가",
-                            "보관방법", "납품갯수(낱개)", "재고(박스)", "재고(낱개)", "총낱개환산"]
-            st.dataframe(view, use_container_width=True, hide_index=True)
+                            "보관방법", "납품갯수(낱개)", "재고(박스)", "재고(낱개)", "총낱개환산", "안전재고(낱개환산)"]
+
+            def _row_style(row):
+                s = int(row["안전재고(낱개환산)"] or 0)
+                if s > 0:
+                    ok = int(row["총낱개환산"]) >= s
+                    return [f"background-color: {'#E8F5E9' if ok else '#FFEBEE'}"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(view.style.apply(_row_style, axis=1),
+                         use_container_width=True, hide_index=True)
+            st.caption("🟩 연초록 = 안전재고 충족 · 🟥 연빨강 = 안전재고 미달 · 무색 = 안전재고 미설정 (제품 관리에서 제품별 입력)")
             csv_button(view, "재고현황", "csv_dash")
         with tab_trend:
             snaps = df_snapshots()
@@ -860,9 +987,13 @@ elif page == "📝 일일 기록":
                     ops = []
                     if r["ttype"] in ("입고", "출고"):
                         sign = -1 if r["ttype"] == "입고" else 1
-                        ops.append(("UPDATE products SET stock_box=stock_box+:b, stock_ea=stock_ea+:e, updated_at=:u WHERE id=:i",
-                                    dict(b=sign * int(r["qty_box"]), e=sign * int(r["qty_ea"]),
-                                         u=KST_NOW(), i=int(r["product_id"]))))
+                        pr2 = prods[prods["id"] == int(r["product_id"])].iloc[0]
+                        nb2, ne2 = normalize_stock(
+                            int(pr2["stock_box"]) + sign * int(r["qty_box"]),
+                            int(pr2["stock_ea"]) + sign * int(r["qty_ea"]),
+                            int(pr2["box_qty"]))
+                        ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
+                                    dict(b=nb2, e=ne2, u=KST_NOW(), i=int(r["product_id"]))))
                     ops.append(("DELETE FROM transactions WHERE id=:i", {"i": del_id}))
                     run_batch(ops)
                     clear_cache()
@@ -961,7 +1092,7 @@ elif page == "📦 제품 관리(엑셀표)":
     prods_view = prods[prods["name"] == sel_detail] if (only_sel and sel_detail and not prods.empty) else prods
 
     grid_cols = ["id", "name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                 "storage", "delivery_ea", "stock_box", "stock_ea", "memo", "updated_at"]
+                 "storage", "delivery_ea", "stock_box", "stock_ea", "safety_ea", "memo", "updated_at"]
     grid = prods_view[grid_cols].copy() if not prods_view.empty else pd.DataFrame(columns=grid_cols)
 
     edited = st.data_editor(
@@ -969,7 +1100,7 @@ elif page == "📦 제품 관리(엑셀표)":
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        disabled=["id", "updated_at"],
+        disabled=["id", "updated_at", "박스환산"],
         column_config={
             "id": st.column_config.NumberColumn("ID", width="small"),
             "name": st.column_config.TextColumn("제품명", required=True),
@@ -985,7 +1116,12 @@ elif page == "📦 제품 관리(엑셀표)":
                                                         help="상온/냉장/냉동"),
             "delivery_ea": st.column_config.NumberColumn("납품갯수(낱개)", min_value=0, step=1),
             "stock_box": st.column_config.NumberColumn("재고(박스)", step=1),
-            "stock_ea": st.column_config.NumberColumn("재고(낱개)", step=1),
+            "stock_ea": st.column_config.NumberColumn(
+                "재고(낱개)", step=1,
+                help="박스입수량 이상 입력하면 저장 시 박스로 자동 변환됩니다"),
+            "safety_ea": st.column_config.NumberColumn(
+                "안전재고(낱개환산)", min_value=0, step=1,
+                help="제품별 안전재고. 총재고(낱개환산)가 이 값 이상이면 대시보드에서 초록 배경으로 표시"),
             "memo": st.column_config.TextColumn("메모"),
             "updated_at": st.column_config.TextColumn("저장시각(자동)", help="이 행이 마지막으로 저장된 일시"),
         },
@@ -1016,8 +1152,12 @@ elif page == "📦 제품 관리(엑셀표)":
                 "delivery_ea": int(r["delivery_ea"]) if pd.notna(r["delivery_ea"]) else 0,
                 "stock_box": int(r["stock_box"]) if pd.notna(r["stock_box"]) else 0,
                 "stock_ea": int(r["stock_ea"]) if pd.notna(r["stock_ea"]) else 0,
+                "safety_ea": int(r["safety_ea"]) if pd.notna(r["safety_ea"]) else 0,
                 "memo": "" if pd.isna(r["memo"]) else str(r["memo"]),
             }
+            # 낱개 → 박스 자동 변환 (예: 입수량 12, 낱개 30 → 박스 +2, 낱개 6)
+            vals["stock_box"], vals["stock_ea"] = normalize_stock(
+                vals["stock_box"], vals["stock_ea"], vals["box_qty"])
             if pd.notna(rid) and int(rid) in old_map:  # 기존 행 수정
                 rid = int(rid); seen_ids.add(rid)
                 old = old_map[rid]
