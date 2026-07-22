@@ -175,8 +175,11 @@ CREATE TABLE IF NOT EXISTS change_logs (
 """
 
 
+SCHEMA_VERSION = 12  # ⚠️ 테이블/컬럼을 추가할 때마다 +1 하세요. 배포 시 자동으로 스키마가 갱신됩니다.
+
+
 @st.cache_resource
-def get_engine():
+def get_engine(schema_version: int):
     url = get_secret("DB_URL")
     if not url:
         st.error("DB_URL이 설정되지 않았습니다. Streamlit Cloud의 Secrets를 확인하세요.")
@@ -245,7 +248,7 @@ def get_engine():
         st.stop()
 
 
-engine = get_engine()
+engine = get_engine(SCHEMA_VERSION)
 
 
 def run(sql: str, **params):
