@@ -393,9 +393,11 @@ def expiry_breakdown() -> pd.DataFrame:
 
         for _ord, exp, left in leftovers:
             dday = ""
-            if exp not in ("(기한없음)", "(기한미상·수동조정)"):
-                dd = (pd.Timestamp(exp).date() - today_kst()).days
+            try:
+                dd = (pd.Timestamp(str(exp)).date() - today_kst()).days
                 dday = f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY")
+            except Exception:
+                dday = ""  # 날짜가 아닌 항목((기한없음)/(기한미상)) 은 공란
             rows.append(dict(제품명=pname, 소비기한=exp,
                              잔여낱개환산=left,
                              박스환산=f"{left // bq}박스 {left % bq}낱개",
@@ -745,13 +747,15 @@ if page == "📊 대시보드":
     if not bd.empty:
         with st.expander("📦 소비기한별 잔여 수량 — 어떤 기한의 낱개가 몇 개 남았는지", expanded=True):
             def _hl_exp(row):
-                exp = row["소비기한"]
-                if exp != "(기한없음)":
-                    dd = (pd.Timestamp(exp).date() - today_kst()).days
-                    if dd < 0:
-                        return ["background-color: #FFEBEE"] * len(row)   # 경과: 연빨강
-                    if dd <= 30:
-                        return ["background-color: #FFF8E1"] * len(row)   # 임박: 연노랑
+                # 날짜가 아닌 값('(기한없음)', '(기한미상·수동조정)' 등)은 색칠하지 않음
+                try:
+                    dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
+                except Exception:
+                    return [""] * len(row)
+                if dd < 0:
+                    return ["background-color: #FFEBEE"] * len(row)   # 경과: 연빨강
+                if dd <= 30:
+                    return ["background-color: #FFF8E1"] * len(row)   # 임박: 연노랑
                 return [""] * len(row)
             st.dataframe(bd.style.apply(_hl_exp, axis=1),
                          use_container_width=True, hide_index=True)
