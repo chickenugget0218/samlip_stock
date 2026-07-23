@@ -343,7 +343,7 @@ def expiry_breakdown() -> pd.DataFrame:
     1) 입고 로트(소비기한별)에서 총출고량을 기한 빠른 순(FIFO)으로 차감
     2) 그 결과 합계를 '현재 재고(표에서 수동 수정한 값 포함)'와 비교해 보정:
        - 실재고가 더 적으면 → 차이를 기한 빠른 로트부터 추가 차감
-       - 실재고가 더 많으면 → '(기한미상·수동조정)' 행으로 표시
+       - 실재고가 더 많으면 → '(수동조정분)' 행으로 ± 표시
     → 잔여 합계가 항상 현재 재고(총낱개환산)와 일치"""
     prods = df_products()
     if prods.empty:
@@ -380,20 +380,13 @@ def expiry_breakdown() -> pd.DataFrame:
                 remain_out -= used
                 if qty - used > 0:
                     leftovers.append([r["_ord"], r["소비기한"] or "(기한없음)", qty - used])
-        # 2단계: 현재 재고와 합계 일치 보정
+        # 2단계: 현재 재고와의 차이는 '(수동조정분)' 행으로 ±표시
+        #  - 일일기록으로 들어온 소비기한 로트는 절대 건드리지 않음 (기록 그대로 표시)
+        #  - 제품 관리(엑셀표)에서 수동으로 넣거나 뺀 분량이 이 행에 모임 → 나중에 일일기록으로 정리하면 0이 됨
         lot_sum = sum(x[2] for x in leftovers)
         diff = int(cur_total) - lot_sum
-        if diff < 0:  # 실재고가 더 적음 → 기한 빠른 로트부터 추가 차감
-            shortfall = -diff
-            for x in leftovers:
-                cut = min(x[2], shortfall)
-                x[2] -= cut
-                shortfall -= cut
-                if shortfall == 0:
-                    break
-            leftovers = [x for x in leftovers if x[2] > 0]
-        elif diff > 0 and cur_total > 0:  # 실재고가 더 많음 → 기한미상 버킷
-            leftovers.append(["9999-99-98", "(기한미상·수동조정)", diff])
+        if diff != 0 and (cur_total != 0 or lot_sum != 0):
+            leftovers.append(["9999-99-98", "(수동조정분)", diff])
 
         for _ord, exp, left in leftovers:
             dday = ""
@@ -402,9 +395,13 @@ def expiry_breakdown() -> pd.DataFrame:
                 dday = f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY")
             except Exception:
                 dday = ""  # 날짜가 아닌 항목((기한없음)/(기한미상)) 은 공란
+            if left >= 0:
+                bx = f"{left // bq}박스 {left % bq}낱개"
+            else:
+                bx = f"-{(-left) // bq}박스 {(-left) % bq}낱개"
             rows.append(dict(제품명=pname, 소비기한=exp,
                              잔여낱개환산=left,
-                             박스환산=f"{left // bq}박스 {left % bq}낱개",
+                             박스환산=bx,
                              디데이=dday))
     return pd.DataFrame(rows)
 
@@ -427,6 +424,15 @@ def df_snapshots() -> pd.DataFrame:
                   n.total_ea AS 재고환산낱개
            FROM stock_snapshots n JOIN products p ON p.id = n.product_id
            ORDER BY n.sdate, p.name""")
+
+
+def search_box(df: pd.DataFrame, key: str, label: str = "🔍 검색") -> pd.DataFrame:
+    """표 위에 검색창을 붙이고, 입력어가 포함된 행만 반환 (모든 컬럼 대상, 대소문자 무시)"""
+    q = st.text_input(label, key=key, placeholder="제품명·매장명 등 일부만 입력해도 검색됩니다")
+    if q:
+        mask = df.apply(lambda r: r.astype(str).str.contains(q, case=False, na=False, regex=False).any(), axis=1)
+        return df[mask]
+    return df
 
 
 def csv_bytes(df: pd.DataFrame) -> bytes:
@@ -759,7 +765,7 @@ if page == "📊 대시보드":
     if not bd.empty:
         with st.expander("📦 소비기한별 잔여 수량 — 어떤 기한의 낱개가 몇 개 남았는지", expanded=True):
             def _hl_exp(row):
-                # 날짜가 아닌 값('(기한없음)', '(기한미상·수동조정)' 등)은 색칠하지 않음
+                # 날짜가 아닌 값('(기한없음)', '(수동조정분)' 등)은 색칠하지 않음
                 try:
                     dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
                 except Exception:
@@ -782,6 +788,7 @@ if page == "📊 대시보드":
 
             pick_p = st.selectbox("제품 필터", ["(전체)"] + sorted(bd["제품명"].unique()), key="exp_pick")
             show = bd if pick_p == "(전체)" else bd[bd["제품명"] == pick_p]
+            show = search_box(show, "search_expiry", "🔍 제품명 검색")
             st.dataframe(show.style.apply(_hl_exp, axis=1),
                          use_container_width=True, hide_index=True)
             if pick_p != "(전체)":
@@ -797,7 +804,7 @@ if page == "📊 대시보드":
             st.dataframe(chk if not gap.empty else chk.head(50),
                          use_container_width=True, hide_index=True)
             st.caption("입고 로트에서 출고량을 기한 빠른 순(FIFO)으로 차감한 뒤, 현재 재고(제품 관리 표에서 수동 수정한 값 포함)와 "
-                       "합계가 일치하도록 자동 보정합니다. 기록으로 설명되지 않는 재고는 '(기한미상·수동조정)' 행에 모입니다.")
+                       "합계가 일치하도록 자동 보정합니다. 일일기록의 소비기한 로트는 그대로 두고, 표에서 수동으로 조정한 차이는 '(수동조정분)' 행에 ±로 모입니다. 수동조정분을 일일기록(입고/출고)으로 옮겨 적으면 이 행은 0이 되어 사라집니다.")
 
     st.subheader("재고 현황")
     if prods.empty:
@@ -1059,8 +1066,9 @@ elif page == "📝 일일 기록":
         if tx.empty:
             st.info("기록이 없습니다.")
         else:
-            st.dataframe(tx.head(30).drop(columns=["id"]), use_container_width=True, hide_index=True)
-            csv_button(tx.drop(columns=["id"]), "입출고기록", "csv_tx")
+            tx_view = search_box(tx.drop(columns=["id"]), "search_tx", "🔍 기록 검색 (제품/매장/메모)")
+            st.dataframe(tx_view.head(50), use_container_width=True, hide_index=True)
+            csv_button(tx_view, "입출고기록", "csv_tx")
             del_id = st.selectbox(
                 "삭제할 기록 선택",
                 options=[0] + tx["id"].tolist(),
@@ -1116,7 +1124,8 @@ elif page == "📈 일자별 누적(수불부)":
                 st.subheader("제품별 누적 요약 — 기초 + 입고합 − 출고합 = 오늘 재고")
                 st.dataframe(summary, use_container_width=True, hide_index=True)
                 st.subheader("전체 일자별 내역")
-                st.dataframe(led.drop(columns=["pid", "기초재고"]), use_container_width=True, hide_index=True)
+                led_view = search_box(led.drop(columns=["pid", "기초재고"]), "search_led", "🔍 제품 검색")
+                st.dataframe(led_view, use_container_width=True, hide_index=True)
                 csv_button(led.drop(columns=["pid"]), "수불부전체", "csv_led")
         else:
             prow = prods[prods["name"] == sel].iloc[0]
@@ -1177,6 +1186,14 @@ elif page == "📦 제품 관리(엑셀표)":
         + (f" — 현재: **{sel_detail}**" if sel_detail else ""),
         value=st.session_state.get("only_sel_prod", False), key="only_sel_prod")
     prods_view = prods[prods["name"] == sel_detail] if (only_sel and sel_detail and not prods.empty) else prods
+    pq = st.text_input("🔍 제품 검색", key="prod_search",
+                       placeholder="제품명·바코드·규격 일부 입력 (예: 카스테라)")
+    if pq and not prods_view.empty:
+        m = (prods_view["name"].astype(str).str.contains(pq, case=False, na=False, regex=False)
+             | prods_view["barcode"].astype(str).str.contains(pq, case=False, na=False, regex=False)
+             | prods_view["spec"].astype(str).str.contains(pq, case=False, na=False, regex=False)
+             | prods_view["memo"].astype(str).str.contains(pq, case=False, na=False, regex=False))
+        prods_view = prods_view[m]
 
     grid_cols = ["id", "name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
                  "storage", "delivery_ea", "stock_box", "stock_ea", "safety_ea", "memo", "updated_at"]
@@ -1406,7 +1423,7 @@ elif page == "🏬 납품처 관리(엑셀표)":
     st.caption("요일 색상: " + _legend + " · 토=청록 / 일=주황 / 매일=회색")
 
     if st.button("💾 저장", type="primary", use_container_width=True):
-        old_map = {int(r["id"]): r for _, r in stores.iterrows()} if not stores.empty else {}
+        old_map = {int(r["id"]): r for _, r in stores_view.iterrows()} if not stores_view.empty else {}
         existing_store_names = set(stores["name"].tolist()) if not stores.empty else set()
         seen, ops = set(), []
         for _, r in edited.iterrows():
@@ -1468,6 +1485,7 @@ elif page == "🏬 납품처 관리(엑셀표)":
                      .rename(columns={"제품명": "납품 제품"}))
         grouped.insert(1, "제품수", grouped["납품 제품"].apply(lambda v: v.count(",") + 1 if v else 0))
         grouped = grouped[["매장명", "납품요일", "제품수", "납품 제품", "납품개소", "점주전화번호"]]
+        grouped = search_box(grouped, "search_group", "🔍 매장·제품 검색")
         st.dataframe(grouped, use_container_width=True, hide_index=True,
                      column_config={"납품 제품": st.column_config.TextColumn("납품 제품", width="large")})
 
@@ -1524,6 +1542,10 @@ elif page == "📋 납품 정리표(매장×제품)":
             bulk["메모"] = bulk["메모"].fillna("")
             bulk["환산낱개"] = bulk["박스"] * bulk["박스입수량"].clip(lower=1) + bulk["낱개"]
 
+            bq_search = st.text_input("🔍 제품 검색", key=f"bulk_search_{sid}",
+                                      placeholder="제품명 일부 입력 → 해당 제품만 표시")
+            if bq_search:
+                bulk = bulk[bulk["제품명"].astype(str).str.contains(bq_search, case=False, na=False, regex=False)]
             bulk_edit = st.data_editor(
                 bulk, hide_index=True, use_container_width=True,
                 disabled=["제품명", "박스입수량", "환산낱개"],
@@ -1575,8 +1597,14 @@ elif page == "📋 납품 정리표(매장×제품)":
 
         # ═══ 모드 B: 기존 행 단위 전체 편집 ═══
         else:
+            plq = st.text_input("🔍 정리표 검색", key="plan_search", placeholder="매장명·제품명 일부 입력")
+            plan_view = plan
+            if plq and not plan.empty:
+                m = (plan["매장명"].astype(str).str.contains(plq, case=False, na=False, regex=False)
+                     | plan["제품명"].astype(str).str.contains(plq, case=False, na=False, regex=False))
+                plan_view = plan[m]
             grid_cols = ["id", "매장명", "제품명", "박스", "낱개", "메모"]
-            grid = plan[grid_cols].copy() if not plan.empty else pd.DataFrame(columns=grid_cols)
+            grid = plan_view[grid_cols].copy() if not plan_view.empty else pd.DataFrame(columns=grid_cols)
 
             edited = st.data_editor(
                 grid, num_rows="dynamic", hide_index=True, use_container_width=True,
@@ -1720,6 +1748,7 @@ elif page == "📜 변경이력":
     d1 = c1.date_input("시작일", value=today_kst().replace(day=1))
     d2 = c2.date_input("종료일", value=today_kst())
     logs = df_logs(d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d"))
+    logs = search_box(logs, "search_logs", "🔍 이력 검색 (제품/항목/값)")
     st.dataframe(logs, use_container_width=True, hide_index=True)
     st.caption(f"총 {len(logs)}건")
     csv_button(logs, "변경이력", "csv_logs")
