@@ -338,6 +338,47 @@ def df_stores() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=20, show_spinner=False)
+def manual_diffs() -> pd.DataFrame:
+    """제품별: 현재고 vs 기록잔여(입고−출고, FIFO) 비교 → 수동조정분(diff) 산출"""
+    prods = df_products()
+    if prods.empty:
+        return pd.DataFrame()
+    net = qdf("""
+        SELECT p.id AS pid,
+               COALESCE(SUM(CASE WHEN t.ttype='입고' THEN t.qty_box*GREATEST(p.box_qty,1)+t.qty_ea
+                                 WHEN t.ttype='출고' THEN -(t.qty_box*GREATEST(p.box_qty,1)+t.qty_ea)
+                                 ELSE 0 END), 0) AS 순기록
+        FROM products p
+        LEFT JOIN transactions t ON t.product_id = p.id AND t.ttype IN ('입고','출고')
+        GROUP BY p.id""")
+    inout = qdf("""
+        SELECT p.id AS pid,
+               COALESCE(SUM(CASE WHEN t.ttype='입고' THEN t.qty_box*GREATEST(p.box_qty,1)+t.qty_ea ELSE 0 END),0) AS 입고합,
+               COALESCE(SUM(CASE WHEN t.ttype='출고' THEN t.qty_box*GREATEST(p.box_qty,1)+t.qty_ea ELSE 0 END),0) AS 출고합
+        FROM products p
+        LEFT JOIN transactions t ON t.product_id = p.id AND t.ttype IN ('입고','출고')
+        GROUP BY p.id""")
+    io_map = {int(r["pid"]): (int(r["입고합"]), int(r["출고합"])) for _, r in inout.iterrows()}
+    rows = []
+    for _, r in prods.iterrows():
+        pid = int(r["id"])
+        cur = total_ea(r)
+        IN_t, OUT_t = io_map.get(pid, (0, 0))
+        M0 = cur - IN_t + OUT_t
+        if M0 >= 0:
+            out_for_lots = max(OUT_t - M0, 0)
+            manual_left = M0 - (OUT_t - out_for_lots)
+        else:
+            out_for_lots = OUT_t + (-M0)
+            manual_left = 0
+        rec = max(IN_t - out_for_lots, 0)          # 소비기한 로트 잔여(합)
+        manual = cur - rec                          # 수동조정분 (= manual_left + 안전망 잔차)
+        rows.append(dict(pid=pid, 제품명=r["name"], box_qty=bq_of(r["box_qty"]),
+                         현재고=cur, 기록잔여=rec, 수동조정분=manual))
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
 def expiry_breakdown() -> pd.DataFrame:
     """제품별 · 소비기한별 잔여 낱개 계산 (현재 재고와 합계 일치 보정 포함).
     1) 입고 로트(소비기한별)에서 총출고량을 기한 빠른 순(FIFO)으로 차감
@@ -367,26 +408,42 @@ def expiry_breakdown() -> pd.DataFrame:
     rows = []
     lot_pids = set(lots["pid"].tolist()) if not lots.empty else set()
     for pid, (pname, bq, cur_total) in cur_map.items():
-        # 1단계: 기록 기반 FIFO 잔여
-        leftovers = []  # [기한(정렬키), 표시기한, 잔여]
+        # ── 차감 순서 원칙 ──
+        #  수동으로 잡아둔 재고(기록 이전부터 있던 오래된 물량)가 먼저 나간 것으로 보고,
+        #  출고는 ① 수동풀(M0)부터 소진 → ② 남으면 소비기한 빠른 로트 순(FIFO)으로 차감.
+        #  → 일일기록으로 입고한 소비기한 로트가 수동재고 출고 때문에 깎여 보이는 문제 방지.
+        IN_total = 0
+        g = None
         if pid in lot_pids:
             g = lots[lots["pid"] == pid].copy()
             g["_ord"] = g["소비기한"].apply(lambda v: v if v else "9999-99-99")
             g = g.sort_values("_ord")
-            remain_out = int(out_map.get(pid, 0))
+            IN_total = int(g["입고낱개"].sum())
+        OUT_total = int(out_map.get(pid, 0))
+        M0 = int(cur_total) - IN_total + OUT_total   # 기록 밖(수동) 기반 재고량
+
+        if M0 >= 0:
+            out_for_lots = max(OUT_total - M0, 0)     # 수동풀 먼저 소진 후 남는 출고량
+            manual_left = M0 - (OUT_total - out_for_lots)
+        else:
+            out_for_lots = OUT_total + (-M0)          # 수동 감소분은 추가 출고처럼 로트에서 차감
+            manual_left = 0
+
+        leftovers = []
+        if g is not None:
+            remain_out = out_for_lots
             for _, r in g.iterrows():
                 qty = int(r["입고낱개"])
                 used = min(qty, remain_out)
                 remain_out -= used
                 if qty - used > 0:
                     leftovers.append([r["_ord"], r["소비기한"] or "(기한없음)", qty - used])
-        # 2단계: 현재 재고와의 차이는 '(수동조정분)' 행으로 ±표시
-        #  - 일일기록으로 들어온 소비기한 로트는 절대 건드리지 않음 (기록 그대로 표시)
-        #  - 제품 관리(엑셀표)에서 수동으로 넣거나 뺀 분량이 이 행에 모임 → 나중에 일일기록으로 정리하면 0이 됨
-        lot_sum = sum(x[2] for x in leftovers)
-        diff = int(cur_total) - lot_sum
-        if diff != 0 and (cur_total != 0 or lot_sum != 0):
-            leftovers.append(["9999-99-98", "(수동조정분)", diff])
+        if manual_left > 0:
+            leftovers.append(["9999-99-98", "(수동조정분)", manual_left])
+        # 안전망: 어떤 경우에도 합계 = 현재고
+        residual = int(cur_total) - sum(x[2] for x in leftovers)
+        if residual != 0:
+            leftovers.append(["9999-99-97", "(수동조정분)", residual])
 
         for _ord, exp, left in leftovers:
             dday = ""
@@ -763,48 +820,87 @@ if page == "📊 대시보드":
 
     # 소비기한별 잔여 수량 분해 (입고 로트 기준, 출고는 기한 빠른 순 차감)
     if not bd.empty:
-        with st.expander("📦 소비기한별 잔여 수량 — 어떤 기한의 낱개가 몇 개 남았는지", expanded=True):
-            def _hl_exp(row):
-                # 날짜가 아닌 값('(기한없음)', '(수동조정분)' 등)은 색칠하지 않음
-                try:
-                    dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
-                except Exception:
+        with st.expander("📦 소비기한별 수량 — 일일기록 기준", expanded=True):
+            tab_raw, tab_calc = st.tabs(["📄 일일기록 그대로 (입력값)", "🧮 잔여 계산 (출고·수동조정 반영)"])
+
+            # ── 탭1: 일일 기록에서 입력한 값을 아무 가공 없이 그대로 표시 ──
+            with tab_raw:
+                raw = qdf("""
+                    SELECT t.tdate AS 입고일, p.name AS 제품명, t.expiry_date AS 소비기한,
+                           t.qty_box AS 박스, t.qty_ea AS 낱개,
+                           (t.qty_box * GREATEST(p.box_qty, 1) + t.qty_ea) AS 환산낱개,
+                           t.memo AS 메모
+                    FROM transactions t JOIN products p ON p.id = t.product_id
+                    WHERE t.ttype = '입고' AND t.expiry_date <> ''
+                    ORDER BY t.expiry_date, t.tdate, t.id""")
+                if raw.empty:
+                    st.info("일일 기록에서 소비기한과 함께 입고를 입력하면 여기에 그대로 표시됩니다.")
+                else:
+                    raw["디데이"] = raw["소비기한"].apply(
+                        lambda e: (lambda dd: f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY"))(
+                            (pd.Timestamp(e).date() - today_kst()).days))
+                    def _hl_raw(row):
+                        try:
+                            dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
+                        except Exception:
+                            return [""] * len(row)
+                        if dd < 0:
+                            return ["background-color: #FFEBEE"] * len(row)
+                        if dd <= 30:
+                            return ["background-color: #FFF8E1"] * len(row)
+                        return [""] * len(row)
+                    raw_view = search_box(raw, "search_raw_exp", "🔍 제품명 검색")
+                    st.dataframe(raw_view.style.apply(_hl_raw, axis=1),
+                                 use_container_width=True, hide_index=True)
+                    tot = raw_view.groupby("제품명", as_index=False)["환산낱개"].sum()
+                    st.caption("제품별 입고 합계(환산낱개): " + " · ".join(
+                        f"**{r['제품명']}** {int(r['환산낱개']):,}" for _, r in tot.iterrows()))
+                    csv_button(raw_view, "소비기한_일일기록그대로", "csv_raw_exp")
+                    st.caption("일일 기록에 입력한 입고 로트를 날짜·소비기한·수량 그대로 보여줍니다 (출고 차감 없음).")
+
+            # ── 탭2: 잔여 계산 (기존 로직: 출고·수동조정 반영, 합계=현재고) ──
+            with tab_calc:
+                def _hl_exp(row):
+                    # 날짜가 아닌 값('(기한없음)', '(수동조정분)' 등)은 색칠하지 않음
+                    try:
+                        dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
+                    except Exception:
+                        return [""] * len(row)
+                    if dd < 0:
+                        return ["background-color: #FFEBEE"] * len(row)   # 경과: 연빨강
+                    if dd <= 30:
+                        return ["background-color: #FFF8E1"] * len(row)   # 임박: 연노랑
                     return [""] * len(row)
-                if dd < 0:
-                    return ["background-color: #FFEBEE"] * len(row)   # 경과: 연빨강
-                if dd <= 30:
-                    return ["background-color: #FFF8E1"] * len(row)   # 임박: 연노랑
-                return [""] * len(row)
-            # 제품별 검산: 현재 재고 vs 소비기한 잔여합계
-            cur_tbl = prods.copy()
-            cur_tbl["현재재고(낱개환산)"] = cur_tbl.apply(total_ea, axis=1)
-            cur_tbl = cur_tbl[["name", "현재재고(낱개환산)"]].rename(columns={"name": "제품명"})
-            sum_tbl = bd.groupby("제품명", as_index=False)["잔여낱개환산"].sum().rename(
-                columns={"잔여낱개환산": "소비기한 잔여합계"})
-            chk = cur_tbl.merge(sum_tbl, on="제품명", how="left").fillna({"소비기한 잔여합계": 0})
-            chk["소비기한 잔여합계"] = chk["소비기한 잔여합계"].astype(int)
-            chk["차이"] = chk["현재재고(낱개환산)"] - chk["소비기한 잔여합계"]
-            gap = chk[chk["차이"] != 0]
+                # 제품별 검산: 현재 재고 vs 소비기한 잔여합계
+                cur_tbl = prods.copy()
+                cur_tbl["현재재고(낱개환산)"] = cur_tbl.apply(total_ea, axis=1)
+                cur_tbl = cur_tbl[["name", "현재재고(낱개환산)"]].rename(columns={"name": "제품명"})
+                sum_tbl = bd.groupby("제품명", as_index=False)["잔여낱개환산"].sum().rename(
+                    columns={"잔여낱개환산": "소비기한 잔여합계"})
+                chk = cur_tbl.merge(sum_tbl, on="제품명", how="left").fillna({"소비기한 잔여합계": 0})
+                chk["소비기한 잔여합계"] = chk["소비기한 잔여합계"].astype(int)
+                chk["차이"] = chk["현재재고(낱개환산)"] - chk["소비기한 잔여합계"]
+                gap = chk[chk["차이"] != 0]
 
-            pick_p = st.selectbox("제품 필터", ["(전체)"] + sorted(bd["제품명"].unique()), key="exp_pick")
-            show = bd if pick_p == "(전체)" else bd[bd["제품명"] == pick_p]
-            show = search_box(show, "search_expiry", "🔍 제품명 검색")
-            st.dataframe(show.style.apply(_hl_exp, axis=1),
-                         use_container_width=True, hide_index=True)
-            if pick_p != "(전체)":
-                st.caption(f"**{pick_p}** 잔여 합계: **{int(show['잔여낱개환산'].sum()):,}낱개** "
-                           f"(현재 재고: {int(chk[chk['제품명']==pick_p]['현재재고(낱개환산)'].iloc[0]):,}낱개)")
-            csv_button(bd, "소비기한별잔여", "csv_expiry_bd")
+                pick_p = st.selectbox("제품 필터", ["(전체)"] + sorted(bd["제품명"].unique()), key="exp_pick")
+                show = bd if pick_p == "(전체)" else bd[bd["제품명"] == pick_p]
+                show = search_box(show, "search_expiry", "🔍 제품명 검색")
+                st.dataframe(show.style.apply(_hl_exp, axis=1),
+                             use_container_width=True, hide_index=True)
+                if pick_p != "(전체)":
+                    st.caption(f"**{pick_p}** 잔여 합계: **{int(show['잔여낱개환산'].sum()):,}낱개** "
+                               f"(현재 재고: {int(chk[chk['제품명']==pick_p]['현재재고(낱개환산)'].iloc[0]):,}낱개)")
+                csv_button(bd, "소비기한별잔여", "csv_expiry_bd")
 
-            st.markdown("**🧮 검산 — 현재 재고 vs 소비기한 잔여합계**")
-            if gap.empty:
-                st.success("✅ 모든 제품에서 소비기한 잔여합계가 현재 재고와 일치합니다.")
-            else:
-                st.error(f"❌ {len(gap)}개 제품에서 수치가 어긋납니다. 아래 표를 확인하세요.")
-            st.dataframe(chk if not gap.empty else chk.head(50),
-                         use_container_width=True, hide_index=True)
-            st.caption("입고 로트에서 출고량을 기한 빠른 순(FIFO)으로 차감한 뒤, 현재 재고(제품 관리 표에서 수동 수정한 값 포함)와 "
-                       "합계가 일치하도록 자동 보정합니다. 일일기록의 소비기한 로트는 그대로 두고, 표에서 수동으로 조정한 차이는 '(수동조정분)' 행에 ±로 모입니다. 수동조정분을 일일기록(입고/출고)으로 옮겨 적으면 이 행은 0이 되어 사라집니다.")
+                st.markdown("**🧮 검산 — 현재 재고 vs 소비기한 잔여합계**")
+                if gap.empty:
+                    st.success("✅ 모든 제품에서 소비기한 잔여합계가 현재 재고와 일치합니다.")
+                else:
+                    st.error(f"❌ {len(gap)}개 제품에서 수치가 어긋납니다. 아래 표를 확인하세요.")
+                st.dataframe(chk if not gap.empty else chk.head(50),
+                             use_container_width=True, hide_index=True)
+                st.caption("입고 로트에서 출고량을 기한 빠른 순(FIFO)으로 차감한 뒤, 현재 재고(제품 관리 표에서 수동 수정한 값 포함)와 "
+                           "합계가 일치하도록 자동 보정합니다. 일일기록의 소비기한 로트는 그대로 두고, 표에서 수동으로 조정한 차이는 '(수동조정분)' 행에 ±로 모입니다. 수동조정분을 일일기록(입고/출고)으로 옮겨 적으면 이 행은 0이 되어 사라집니다.")
 
     st.subheader("재고 현황")
     if prods.empty:
@@ -1305,6 +1401,63 @@ elif page == "📦 제품 관리(엑셀표)":
         clear_cache("prod_editor")
         st.success(f"✅ 저장 완료 — 변경 {changes}건이 변경이력에 기록되었습니다.")
         st.rerun()
+
+    # ── 수동입력분 정리 도구 ──
+    st.divider()
+    with st.expander("🧹 수동입력분 정리 — 소비기한 수량 맞추기", expanded=False):
+        md = manual_diffs()
+        targets = md[md["수동조정분"] != 0] if not md.empty else pd.DataFrame()
+        if targets.empty:
+            st.success("✅ 모든 제품의 재고가 입출고 기록과 일치합니다. 정리할 수동입력분이 없습니다.")
+        else:
+            st.caption("현재고와 입출고 기록이 어긋난 제품 목록입니다. 제품을 골라 처리 방법을 선택하세요.")
+            st.dataframe(targets[["제품명", "현재고", "기록잔여", "수동조정분"]],
+                         use_container_width=True, hide_index=True)
+
+            fix_name = st.selectbox("정리할 제품", targets["제품명"].tolist(), key="fix_prod")
+            row = targets[targets["제품명"] == fix_name].iloc[0]
+            fpid, fbq = int(row["pid"]), int(row["box_qty"])
+            fdiff = int(row["수동조정분"])
+            st.info(f"**{fix_name}** — 현재고 {row['현재고']:,}낱개 / 기록잔여 {row['기록잔여']:,}낱개 / "
+                    f"수동조정분 **{fdiff:+,}낱개**")
+
+            method = st.radio("처리 방법", [
+                "🗑️ 수동분 삭제 — 재고를 기록 기준으로 되돌림 (소비기한 표와 즉시 일치)",
+                "📝 기록으로 전환 — 재고는 유지하고 입고/출고 기록을 생성 (소비기한 지정 가능)",
+            ], key="fix_method")
+
+            exp_use2 = exp_date2 = None
+            if method.startswith("📝") and fdiff > 0:
+                exp_use2 = st.checkbox("전환되는 입고분에 소비기한 입력", key="fix_exp_use")
+                exp_date2 = st.date_input("소비기한", value=today_kst(), key="fix_exp_date",
+                                          label_visibility="collapsed")
+
+            if st.button("⚡ 정리 실행", type="primary", use_container_width=True, key="fix_run"):
+                ops = []
+                if method.startswith("🗑️"):
+                    rec = int(row["기록잔여"])
+                    nb, ne = rec // fbq, rec % fbq
+                    ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
+                                dict(b=nb, e=ne, u=KST_NOW(), i=fpid)))
+                    ops.append(log_op(fix_name, "stock_box",
+                                      f"수동조정분 {fdiff:+,}낱개 포함 {row['현재고']:,}낱개",
+                                      f"기록 기준 {rec:,}낱개(박스 {nb}/낱개 {ne})로 정리 [수동분 삭제]"))
+                else:
+                    ttype2 = "입고" if fdiff > 0 else "출고"
+                    qty = abs(fdiff)
+                    ex2 = exp_date2.strftime("%Y-%m-%d") if (exp_use2 and exp_date2) else ""
+                    ops.append((
+                        "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, expiry_date, memo, created_at) "
+                        "VALUES (:d, :p, :t, NULL, 0, :qe, :ex, :m, :c)",
+                        dict(d=TODAY(), p=fpid, t=ttype2, qe=qty, ex=ex2,
+                             m="[수동분 기록전환] 재고-기록 차이 정리", c=KST_NOW())))
+                    ops.append(log_op(fix_name, "stock_box",
+                                      f"수동조정분 {fdiff:+,}낱개",
+                                      f"{ttype2} {qty:,}낱개 기록으로 전환 (재고 변동 없음)"))
+                run_batch(ops)
+                clear_cache("prod_editor")
+                st.success(f"✅ '{fix_name}' 정리 완료 — 소비기한별 잔여 수량이 이제 일치합니다.")
+                st.rerun()
 
     # ── 제품 상세: 이미지 / 구성품 / 납품처 ──
     st.divider()
