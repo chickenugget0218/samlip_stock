@@ -335,9 +335,15 @@ def df_stores() -> pd.DataFrame:
 
 @st.cache_data(ttl=20, show_spinner=False)
 def expiry_breakdown() -> pd.DataFrame:
-    """제품별 · 소비기한별 잔여 낱개 계산.
-    입고 로트(소비기한별 환산낱개)에서 총출고량을 기한 빠른 순(FIFO)으로 차감한 잔여를 반환.
-    ※ 입출고 '기록' 기준이므로, 제품 관리에서 재고를 수동 조정한 분은 로트에 반영되지 않음."""
+    """제품별 · 소비기한별 잔여 낱개 계산 (현재 재고와 합계 일치 보정 포함).
+    1) 입고 로트(소비기한별)에서 총출고량을 기한 빠른 순(FIFO)으로 차감
+    2) 그 결과 합계를 '현재 재고(표에서 수동 수정한 값 포함)'와 비교해 보정:
+       - 실재고가 더 적으면 → 차이를 기한 빠른 로트부터 추가 차감
+       - 실재고가 더 많으면 → '(기한미상·수동조정)' 행으로 표시
+    → 잔여 합계가 항상 현재 재고(총낱개환산)와 일치"""
+    prods = df_products()
+    if prods.empty:
+        return pd.DataFrame()
     lots = qdf("""
         SELECT p.id AS pid, p.name AS 제품명, p.box_qty,
                t.expiry_date AS 소비기한,
@@ -350,32 +356,50 @@ def expiry_breakdown() -> pd.DataFrame:
                SUM(t.qty_box * GREATEST(p.box_qty,1) + t.qty_ea) AS 출고낱개
         FROM transactions t JOIN products p ON p.id = t.product_id
         WHERE t.ttype = '출고' GROUP BY product_id""")
-    if lots.empty:
-        return pd.DataFrame()
     out_map = dict(zip(outs["pid"], outs["출고낱개"])) if not outs.empty else {}
+    cur_map = {int(r["id"]): (r["name"], max(int(r["box_qty"]), 1), total_ea(r))
+               for _, r in prods.iterrows()}
+
     rows = []
-    for pid, g in lots.groupby("pid"):
-        # 기한 있는 로트를 빠른 날짜순으로 먼저, 기한 없는 로트는 마지막에 차감
-        g = g.copy()
-        g["_ord"] = g["소비기한"].apply(lambda v: v if v else "9999-99-99")
-        g = g.sort_values("_ord")
-        remain_out = int(out_map.get(pid, 0))
-        for _, r in g.iterrows():
-            qty = int(r["입고낱개"])
-            used = min(qty, remain_out)
-            remain_out -= used
-            left = qty - used
-            if left > 0:
-                bq = max(int(r["box_qty"]), 1)
-                exp = r["소비기한"] or "(기한없음)"
-                dday = ""
-                if r["소비기한"]:
-                    dd = (pd.Timestamp(r["소비기한"]).date() - today_kst()).days
-                    dday = f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY")
-                rows.append(dict(제품명=r["제품명"], 소비기한=exp,
-                                 잔여낱개환산=left,
-                                 박스환산=f"{left // bq}박스 {left % bq}낱개",
-                                 디데이=dday))
+    lot_pids = set(lots["pid"].tolist()) if not lots.empty else set()
+    for pid, (pname, bq, cur_total) in cur_map.items():
+        # 1단계: 기록 기반 FIFO 잔여
+        leftovers = []  # [기한(정렬키), 표시기한, 잔여]
+        if pid in lot_pids:
+            g = lots[lots["pid"] == pid].copy()
+            g["_ord"] = g["소비기한"].apply(lambda v: v if v else "9999-99-99")
+            g = g.sort_values("_ord")
+            remain_out = int(out_map.get(pid, 0))
+            for _, r in g.iterrows():
+                qty = int(r["입고낱개"])
+                used = min(qty, remain_out)
+                remain_out -= used
+                if qty - used > 0:
+                    leftovers.append([r["_ord"], r["소비기한"] or "(기한없음)", qty - used])
+        # 2단계: 현재 재고와 합계 일치 보정
+        lot_sum = sum(x[2] for x in leftovers)
+        diff = int(cur_total) - lot_sum
+        if diff < 0:  # 실재고가 더 적음 → 기한 빠른 로트부터 추가 차감
+            shortfall = -diff
+            for x in leftovers:
+                cut = min(x[2], shortfall)
+                x[2] -= cut
+                shortfall -= cut
+                if shortfall == 0:
+                    break
+            leftovers = [x for x in leftovers if x[2] > 0]
+        elif diff > 0 and cur_total > 0:  # 실재고가 더 많음 → 기한미상 버킷
+            leftovers.append(["9999-99-98", "(기한미상·수동조정)", diff])
+
+        for _ord, exp, left in leftovers:
+            dday = ""
+            if exp not in ("(기한없음)", "(기한미상·수동조정)"):
+                dd = (pd.Timestamp(exp).date() - today_kst()).days
+                dday = f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY")
+            rows.append(dict(제품명=pname, 소비기한=exp,
+                             잔여낱개환산=left,
+                             박스환산=f"{left // bq}박스 {left % bq}낱개",
+                             디데이=dday))
     return pd.DataFrame(rows)
 
 
@@ -732,8 +756,8 @@ if page == "📊 대시보드":
             st.dataframe(bd.style.apply(_hl_exp, axis=1),
                          use_container_width=True, hide_index=True)
             csv_button(bd, "소비기한별잔여", "csv_expiry_bd")
-            st.caption("입고 시 기록한 소비기한 로트에서 출고량을 기한 빠른 순으로 차감한 잔여입니다. "
-                       "재고를 표에서 직접 수정한 분은 로트에 반영되지 않습니다.")
+            st.caption("입고 로트에서 출고량을 기한 빠른 순으로 차감한 뒤, 현재 재고(표에서 수동 수정한 값 포함)와 "
+                       "합계가 일치하도록 자동 보정한 잔여입니다. 수동으로 늘린 재고는 '(기한미상·수동조정)'으로 표시됩니다.")
 
     st.subheader("재고 현황")
     if prods.empty:
