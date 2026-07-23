@@ -296,10 +296,14 @@ def snapshot_today():
         pass  # 스냅샷 실패가 앱 사용을 막지 않도록
 
 
-def clear_cache():
-    """저장 후: 오늘 재고 스냅샷 갱신 + 조회 캐시 초기화 → 항상 최신 데이터 표시"""
+def clear_cache(*editor_keys):
+    """저장 후: 오늘 재고 스냅샷 갱신 + 조회 캐시 초기화 + 표 편집기 상태 초기화.
+    ※ st.data_editor는 key별로 수정 내역(delta)을 세션에 보관했다가 재실행 때 다시 덧씌운다.
+       저장 후 이를 지우지 않으면 DB에는 반영돼도 화면이 옛 값으로 되돌아간 것처럼 보인다."""
     snapshot_today()
     st.cache_data.clear()
+    for k in editor_keys:
+        st.session_state.pop(k, None)
 
 
 # ──────────────────────────────────────────────
@@ -357,7 +361,7 @@ def expiry_breakdown() -> pd.DataFrame:
         FROM transactions t JOIN products p ON p.id = t.product_id
         WHERE t.ttype = '출고' GROUP BY product_id""")
     out_map = dict(zip(outs["pid"], outs["출고낱개"])) if not outs.empty else {}
-    cur_map = {int(r["id"]): (r["name"], max(int(r["box_qty"]), 1), total_ea(r))
+    cur_map = {int(r["id"]): (r["name"], bq_of(r["box_qty"]), total_ea(r))
                for _, r in prods.iterrows()}
 
     rows = []
@@ -534,11 +538,20 @@ def df_logs(d1=None, d2=None) -> pd.DataFrame:
     return qdf(q, **params)
 
 
+def bq_of(v) -> int:
+    """박스입수량 안전 변환 (미입력/NaN/0 → 1)"""
+    try:
+        n = int(v)
+    except Exception:
+        return 1
+    return max(n, 1)
+
+
 def fmt_stock(box, ea, box_qty) -> str:
     """재고를 박스 단위로 자동 정규화해 표시 (보기 전용, 저장값은 그대로).
     예: 박스입수량 12, 재고 낱개 75 → '6박스 3낱개'"""
-    bq = max(int(box_qty), 1)
-    total = int(box) * bq + int(ea)
+    bq = bq_of(box_qty)
+    total = int(box or 0) * bq + int(ea or 0)
     if total < 0:
         return f"{total}낱개(음수)"
     return f"{total // bq}박스 {total % bq}낱개"
@@ -553,13 +566,13 @@ def safety_mark(total: int, safety) -> str:
 
 
 def total_ea(row) -> int:
-    return int(row["stock_box"]) * max(int(row["box_qty"]), 1) + int(row["stock_ea"])
+    return int(row["stock_box"] or 0) * bq_of(row["box_qty"]) + int(row["stock_ea"] or 0)
 
 
 def normalize_stock(box: int, ea: int, box_qty: int):
     """낱개가 박스입수량 이상이면 박스로 자동 변환. 예) 입수량12, 낱개30 → 박스+2 낱개6"""
-    bq = max(int(box_qty), 1)
-    total = int(box) * bq + int(ea)
+    bq = bq_of(box_qty)
+    total = int(box or 0) * bq + int(ea or 0)
     if total >= 0:
         return total // bq, total % bq
     return 0, total  # 음수 재고는 낱개에 표시
@@ -567,8 +580,8 @@ def normalize_stock(box: int, ea: int, box_qty: int):
 
 def normalize_stock(box: int, ea: int, box_qty: int):
     """낱개가 박스입수량 이상이면 박스로 자동 환산 (예: 입수량 12, 낱개 50 → 박스 +4, 낱개 2)"""
-    bq = max(int(box_qty), 1)
-    total = int(box) * bq + int(ea)
+    bq = bq_of(box_qty)
+    total = int(box or 0) * bq + int(ea or 0)
     if total < 0:
         return int(box), int(ea)
     return total // bq, total % bq
@@ -724,26 +737,25 @@ if page == "📊 대시보드":
                     "safety_ea": "안전재고(낱개환산)"}),
                 use_container_width=True, hide_index=True)
 
-    # 소비기한 임박 경고 (입고 기록 기준, 30일 이내)
-    exp = qdf(
-        """SELECT t.expiry_date AS 소비기한, p.name AS 제품명, t.tdate AS 입고일,
-                  t.qty_box AS 박스, t.qty_ea AS 낱개, t.memo AS 메모
-           FROM transactions t JOIN products p ON p.id = t.product_id
-           WHERE t.ttype = '입고' AND t.expiry_date <> ''
-           ORDER BY t.expiry_date""")
-    if not exp.empty:
+    # 소비기한 관련 표는 모두 하나의 계산(expiry_breakdown)에서 파생 → 수치 불일치 방지
+    bd = expiry_breakdown()
+
+    # 소비기한 임박 경고 (남아있는 수량 기준, 30일 이내)
+    if not bd.empty:
         from datetime import timedelta
         limit = (today_kst() + timedelta(days=30)).strftime("%Y-%m-%d")
-        soon = exp[exp["소비기한"] <= limit]
+        dated = bd[bd["소비기한"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)]
+        soon = dated[dated["소비기한"] <= limit]
         if not soon.empty:
             passed = soon[soon["소비기한"] < TODAY()]
             if not passed.empty:
-                st.error(f"🚨 소비기한 경과 {len(passed)}건")
-            st.warning(f"⏰ 소비기한 30일 이내(경과 포함) {len(soon)}건")
-            st.dataframe(soon, use_container_width=True, hide_index=True)
+                st.error(f"🚨 소비기한 경과 {len(passed)}건 · 잔여 {int(passed['잔여낱개환산'].sum()):,}낱개")
+            st.warning(f"⏰ 소비기한 30일 이내(경과 포함) {len(soon)}건 · "
+                       f"잔여 합계 {int(soon['잔여낱개환산'].sum()):,}낱개")
+            st.dataframe(soon.sort_values("소비기한"), use_container_width=True, hide_index=True)
+            st.caption("※ 입고 당시 수량이 아니라, 출고·재고조정을 반영한 **현재 남아있는 수량**입니다.")
 
     # 소비기한별 잔여 수량 분해 (입고 로트 기준, 출고는 기한 빠른 순 차감)
-    bd = expiry_breakdown()
     if not bd.empty:
         with st.expander("📦 소비기한별 잔여 수량 — 어떤 기한의 낱개가 몇 개 남았는지", expanded=True):
             def _hl_exp(row):
@@ -757,11 +769,35 @@ if page == "📊 대시보드":
                 if dd <= 30:
                     return ["background-color: #FFF8E1"] * len(row)   # 임박: 연노랑
                 return [""] * len(row)
-            st.dataframe(bd.style.apply(_hl_exp, axis=1),
+            # 제품별 검산: 현재 재고 vs 소비기한 잔여합계
+            cur_tbl = prods.copy()
+            cur_tbl["현재재고(낱개환산)"] = cur_tbl.apply(total_ea, axis=1)
+            cur_tbl = cur_tbl[["name", "현재재고(낱개환산)"]].rename(columns={"name": "제품명"})
+            sum_tbl = bd.groupby("제품명", as_index=False)["잔여낱개환산"].sum().rename(
+                columns={"잔여낱개환산": "소비기한 잔여합계"})
+            chk = cur_tbl.merge(sum_tbl, on="제품명", how="left").fillna({"소비기한 잔여합계": 0})
+            chk["소비기한 잔여합계"] = chk["소비기한 잔여합계"].astype(int)
+            chk["차이"] = chk["현재재고(낱개환산)"] - chk["소비기한 잔여합계"]
+            gap = chk[chk["차이"] != 0]
+
+            pick_p = st.selectbox("제품 필터", ["(전체)"] + sorted(bd["제품명"].unique()), key="exp_pick")
+            show = bd if pick_p == "(전체)" else bd[bd["제품명"] == pick_p]
+            st.dataframe(show.style.apply(_hl_exp, axis=1),
                          use_container_width=True, hide_index=True)
+            if pick_p != "(전체)":
+                st.caption(f"**{pick_p}** 잔여 합계: **{int(show['잔여낱개환산'].sum()):,}낱개** "
+                           f"(현재 재고: {int(chk[chk['제품명']==pick_p]['현재재고(낱개환산)'].iloc[0]):,}낱개)")
             csv_button(bd, "소비기한별잔여", "csv_expiry_bd")
-            st.caption("입고 로트에서 출고량을 기한 빠른 순으로 차감한 뒤, 현재 재고(표에서 수동 수정한 값 포함)와 "
-                       "합계가 일치하도록 자동 보정한 잔여입니다. 수동으로 늘린 재고는 '(기한미상·수동조정)'으로 표시됩니다.")
+
+            st.markdown("**🧮 검산 — 현재 재고 vs 소비기한 잔여합계**")
+            if gap.empty:
+                st.success("✅ 모든 제품에서 소비기한 잔여합계가 현재 재고와 일치합니다.")
+            else:
+                st.error(f"❌ {len(gap)}개 제품에서 수치가 어긋납니다. 아래 표를 확인하세요.")
+            st.dataframe(chk if not gap.empty else chk.head(50),
+                         use_container_width=True, hide_index=True)
+            st.caption("입고 로트에서 출고량을 기한 빠른 순(FIFO)으로 차감한 뒤, 현재 재고(제품 관리 표에서 수동 수정한 값 포함)와 "
+                       "합계가 일치하도록 자동 보정합니다. 기록으로 설명되지 않는 재고는 '(기한미상·수동조정)' 행에 모입니다.")
 
     st.subheader("재고 현황")
     if prods.empty:
@@ -997,7 +1033,7 @@ elif page == "📝 일일 기록":
                                               f"박스 {pr['stock_box']} / 낱개 {pr['stock_ea']}",
                                               f"박스 {new_box} / 낱개 {new_ea} (일괄기록 환산 {'+' if delta>=0 else ''}{delta}낱개)"))
                         run_batch(ops)
-                        clear_cache()
+                        clear_cache("daily_bulk_editor")
                         st.success(f"✅ {bdate.strftime('%Y-%m-%d')} · {len(valid)}건 일괄 저장 완료")
                         st.rerun()
 
@@ -1212,7 +1248,17 @@ elif page == "📦 제품 관리(엑셀표)":
             if pd.notna(rid) and int(rid) in old_map:  # 기존 행 수정
                 rid = int(rid); seen_ids.add(rid)
                 old = old_map[rid]
-                diff = {k: v for k, v in vals.items() if str(old[k]) != str(v)}
+                def _norm(x):
+                    if x is None or (isinstance(x, float) and pd.isna(x)):
+                        return ""
+                    if isinstance(x, (int, float)) and not isinstance(x, bool):
+                        try:
+                            return str(int(x))
+                        except Exception:
+                            return str(x)
+                    return str(x).strip()
+                diff = {k: v for k, v in vals.items()
+                        if _norm(old[k] if k in old.index else None) != _norm(v)}
                 if diff:
                     sets = ", ".join(f"{k}=:{k}" for k in diff)
                     ops.append((f"UPDATE products SET {sets}, updated_at=:ua WHERE id=:rid",
@@ -1239,7 +1285,7 @@ elif page == "📦 제품 관리(엑셀표)":
                 changes += 1
 
         run_batch(ops)  # 모든 변경을 한 번의 트랜잭션으로 → 저장 속도 대폭 개선
-        clear_cache()
+        clear_cache("prod_editor")
         st.success(f"✅ 저장 완료 — 변경 {changes}건이 변경이력에 기록되었습니다.")
         st.rerun()
 
@@ -1289,7 +1335,7 @@ elif page == "📦 제품 관리(엑셀표)":
                         names.append(f"{nm}x{q}")
                 ops.append(log_op(sel, "구성품", "(수정 전)", ", ".join(names) or "(없음)"))
                 run_batch(ops)
-                clear_cache()
+                clear_cache(f"items{pid}")
                 st.success("구성품 저장 완료")
 
             st.markdown("**납품 매장 (매장명·납품개소)**")
@@ -1401,7 +1447,7 @@ elif page == "🏬 납품처 관리(엑셀표)":
                 ops.append(("DELETE FROM stores WHERE id=:i", {"i": rid}))
                 ops.append(log_op(f"[매장] {old['name']}", "매장정보", old["name"], "(삭제됨)"))
         run_batch(ops)
-        clear_cache()
+        clear_cache("store_editor")
         st.success("저장 완료")
         st.rerun()
 
@@ -1523,7 +1569,7 @@ elif page == "📋 납품 정리표(매장×제품)":
                                               f"박스 {qb} / 낱개 {qe}"))
                             changes += 1
                     run_batch(ops)
-                    clear_cache()
+                    clear_cache(f"bulk_editor_{sid}")
                     st.success(f"✅ '{sel_store}' 정리표 저장 완료 — 변경 {changes}건")
                     st.rerun()
 
