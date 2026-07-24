@@ -346,11 +346,9 @@ def manual_diffs() -> pd.DataFrame:
         IN_t, OUT_t = io_map.get(pid, (0, 0))
         M0 = cur - IN_t + OUT_t
         if M0 >= 0:
-            out_for_lots = max(OUT_t - M0, 0)
-            manual_left = M0 - (OUT_t - out_for_lots)
+            out_for_lots = OUT_t                        # 기한 짧은 로트부터 차감
         else:
             out_for_lots = OUT_t + (-M0)
-            manual_left = 0
         rec = max(IN_t - out_for_lots, 0)          # 소비기한 로트 잔여(합)
         manual = cur - rec                          # 수동조정분 (= manual_left + 안전망 잔차)
         rows.append(dict(pid=pid, 제품명=r["name"], box_qty=bq_of(r["box_qty"]),
@@ -388,10 +386,10 @@ def expiry_breakdown() -> pd.DataFrame:
     rows = []
     lot_pids = set(lots["pid"].tolist()) if not lots.empty else set()
     for pid, (pname, bq, cur_total) in cur_map.items():
-        # ── 차감 순서 원칙 ──
-        #  수동으로 잡아둔 재고(기록 이전부터 있던 오래된 물량)가 먼저 나간 것으로 보고,
-        #  출고는 ① 수동풀(M0)부터 소진 → ② 남으면 소비기한 빠른 로트 순(FIFO)으로 차감.
-        #  → 일일기록으로 입고한 소비기한 로트가 수동재고 출고 때문에 깎여 보이는 문제 방지.
+        # ── 차감 순서 원칙 (유통기한 우선) ──
+        #  출고는 ① 소비기한이 짧은 로트부터(FIFO) 차감 → ② 로트를 다 쓰면 수동재고(M0)에서 차감.
+        #  제품 관리(엑셀표)에서 재고를 줄인 경우(M0<0)도 추가 출고처럼 짧은 로트부터 차감.
+        #  → 일일기록에서 출고로 수량을 맞추면 기한 짧은 로트가 즉시 줄어듦.
         IN_total = 0
         g = None
         if pid in lot_pids:
@@ -403,10 +401,11 @@ def expiry_breakdown() -> pd.DataFrame:
         M0 = int(cur_total) - IN_total + OUT_total   # 기록 밖(수동) 기반 재고량
 
         if M0 >= 0:
-            out_for_lots = max(OUT_total - M0, 0)     # 수동풀 먼저 소진 후 남는 출고량
-            manual_left = M0 - (OUT_total - out_for_lots)
+            out_for_lots = OUT_total                  # 기한 짧은 로트부터 전량 차감 시도
+            manual_left = M0 - max(OUT_total - IN_total, 0)   # 로트 초과분만 수동재고에서
+            manual_left = max(manual_left, 0)
         else:
-            out_for_lots = OUT_total + (-M0)          # 수동 감소분은 추가 출고처럼 로트에서 차감
+            out_for_lots = OUT_total + (-M0)          # 수동 감소분도 짧은 로트부터 차감
             manual_left = 0
 
         leftovers = []
