@@ -172,7 +172,8 @@ def get_engine(schema_version: int):
         masked = "(URL 형식 해석 실패 — DB_URL 형식 자체가 잘못됨)"
 
     try:
-        eng = create_engine(url, pool_pre_ping=True,
+        eng = create_engine(url, pool_pre_ping=False, pool_recycle=240,
+                            pool_size=5, max_overflow=5,
                             connect_args={"connect_timeout": 10})
         with eng.begin() as c:
             for stmt in DDL.split(";"):
@@ -231,18 +232,34 @@ def get_engine(schema_version: int):
 engine = get_engine(SCHEMA_VERSION)
 
 
+def _with_retry(fn):
+    """유휴 연결이 끊긴 경우 1회 재연결 후 재시도 (pre_ping 제거로 빨라진 대신 안전망)"""
+    try:
+        return fn()
+    except Exception:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+        return fn()
+
+
 def run(sql: str, **params):
-    with engine.begin() as c:
-        c.execute(text(sql), params)
+    def _f():
+        with engine.begin() as c:
+            c.execute(text(sql), params)
+    _with_retry(_f)
 
 
 def run_batch(ops: list):
     """[(sql, params_dict), ...] 를 한 번의 트랜잭션(왕복 최소화)으로 실행 → 저장 속도 개선"""
     if not ops:
         return
-    with engine.begin() as c:
-        for sql, params in ops:
-            c.execute(text(sql), params)
+    def _f():
+        with engine.begin() as c:
+            for sql, params in ops:
+                c.execute(text(sql), params)
+    _with_retry(_f)
 
 
 LOG_SQL = ("INSERT INTO change_logs (log_date, product_name, field, old_value, new_value, changed_at) "
@@ -257,7 +274,7 @@ def log_op(product_name: str, field: str, old, new):
 
 
 def qdf(sql: str, **params) -> pd.DataFrame:
-    return pd.read_sql_query(text(sql), engine, params=params)
+    return _with_retry(lambda: pd.read_sql_query(text(sql), engine, params=params))
 
 
 SNAPSHOT_SQL = """
@@ -375,11 +392,19 @@ def expiry_breakdown() -> pd.DataFrame:
         WHERE t.ttype = '입고'
         GROUP BY p.id, p.name, p.box_qty, t.expiry_date""")
     outs = qdf("""
-        SELECT product_id AS pid,
+        SELECT product_id AS pid, t.expiry_date AS 지정기한,
                SUM(t.qty_box * GREATEST(p.box_qty,1) + t.qty_ea) AS 출고낱개
         FROM transactions t JOIN products p ON p.id = t.product_id
-        WHERE t.ttype = '출고' GROUP BY product_id""")
-    out_map = dict(zip(outs["pid"], outs["출고낱개"])) if not outs.empty else {}
+        WHERE t.ttype = '출고' GROUP BY product_id, t.expiry_date""")
+    # 기한 지정 출고: {(pid, 기한): 수량} / 미지정 출고: {pid: 수량}
+    out_target, out_plain = {}, {}
+    if not outs.empty:
+        for _, _o in outs.iterrows():
+            _pid, _ex, _q = int(_o["pid"]), str(_o["지정기한"] or ""), int(_o["출고낱개"])
+            if _ex:
+                out_target[(_pid, _ex)] = out_target.get((_pid, _ex), 0) + _q
+            else:
+                out_plain[_pid] = out_plain.get(_pid, 0) + _q
     cur_map = {int(r["id"]): (r["name"], bq_of(r["box_qty"]), total_ea(r))
                for _, r in prods.iterrows()}
 
@@ -397,26 +422,44 @@ def expiry_breakdown() -> pd.DataFrame:
             g["_ord"] = g["소비기한"].apply(lambda v: v if v else "9999-99-99")
             g = g.sort_values("_ord")
             IN_total = int(g["입고낱개"].sum())
-        OUT_total = int(out_map.get(pid, 0))
+        OUT_total = sum(q for (p2, _), q in out_target.items() if p2 == pid) + int(out_plain.get(pid, 0))
         M0 = int(cur_total) - IN_total + OUT_total   # 기록 밖(수동) 기반 재고량
 
-        if M0 >= 0:
-            out_for_lots = OUT_total                  # 기한 짧은 로트부터 전량 차감 시도
-            manual_left = M0 - max(OUT_total - IN_total, 0)   # 로트 초과분만 수동재고에서
-            manual_left = max(manual_left, 0)
-        else:
-            out_for_lots = OUT_total + (-M0)          # 수동 감소분도 짧은 로트부터 차감
+        # 로트별 수량 사전 구성 (기한 오름차순)
+        lot_list = []   # [기한(빈값=''), 수량]
+        if g is not None:
+            for _, r in g.iterrows():
+                lot_list.append([str(r["소비기한"] or ""), int(r["입고낱개"])])
+        # ①단계: 소비기한을 지정한 출고 → 같은 기한 로트에서 직접 차감 (초과분은 FEFO 풀로)
+        spill_to_fefo = 0
+        for i, (ex, q) in enumerate(lot_list):
+            t_out = out_target.get((pid, ex), 0)
+            take = min(q, t_out)
+            lot_list[i][1] = q - take
+            spill_to_fefo += t_out - take
+        # 지정기한이 로트에 없는 출고(오타 등)도 FEFO 풀로
+        matched = {ex for ex, _ in lot_list}
+        for (p2, ex), q in out_target.items():
+            if p2 == pid and ex not in matched:
+                spill_to_fefo += q
+        # ②단계: 미지정 출고 + 지정 초과분 + 수동 감소분 → 짧은 기한부터(FEFO)
+        extra_out = -M0 if M0 < 0 else 0
+        fefo_out = int(out_plain.get(pid, 0)) + spill_to_fefo + extra_out
+        remain = fefo_out
+        for i, (ex, q) in enumerate(lot_list):
+            take = min(q, remain)
+            remain -= take
+            lot_list[i][1] = q - take
+        # ③단계: 로트로 못 막은 출고는 수동재고에서
+        manual_left = max(M0, 0) - remain
+        if manual_left < 0:
             manual_left = 0
 
         leftovers = []
-        if g is not None:
-            remain_out = out_for_lots
-            for _, r in g.iterrows():
-                qty = int(r["입고낱개"])
-                used = min(qty, remain_out)
-                remain_out -= used
-                if qty - used > 0:
-                    leftovers.append([r["_ord"], r["소비기한"] or "(기한없음)", qty - used])
+        for ex, q in lot_list:
+            if q > 0:
+                ordkey = ex if ex else "9999-99-99"
+                leftovers.append([ordkey, ex or "(기한없음)", q])
         if manual_left > 0:
             leftovers.append(["9999-99-98", "(수동조정분)", manual_left])
         # 안전망: 어떤 경우에도 합계 = 현재고
