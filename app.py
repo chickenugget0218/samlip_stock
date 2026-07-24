@@ -48,10 +48,67 @@ if not st.session_state.get("snapshot_done"):
     snapshot_today()
     st.session_state["snapshot_done"] = True
 
+def render_schedule_calendar(sched: pd.DataFrame, cutt: str, key_prefix: str = "cal"):
+    """교체·발주 달력 렌더링 (대시보드/일정 페이지 공용). key_prefix로 위젯 충돌 방지."""
+    st.subheader("🗓️ 교체·발주 달력")
+    okey = f"{key_prefix}_cal_offset"
+    if okey not in st.session_state:
+        st.session_state[okey] = 0
+    cprev, ctitle, cnext = st.columns([1, 3, 1])
+    if cprev.button("◀ 이전달", key=f"{key_prefix}_cal_prev"):
+        st.session_state[okey] -= 1
+        st.rerun()
+    if cnext.button("다음달 ▶", key=f"{key_prefix}_cal_next"):
+        st.session_state[okey] += 1
+        st.rerun()
+    base = today_kst().replace(day=15)
+    ym = base.month - 1 + st.session_state[okey]
+    year, month = base.year + ym // 12, ym % 12 + 1
+    ctitle.markdown(f"<h3 style='text-align:center'>{year}년 {month}월</h3>", unsafe_allow_html=True)
+
+    events = {}
+
+    def _add(dstr, label, css):
+        try:
+            d = pd.Timestamp(dstr).date()
+        except Exception:
+            return
+        events.setdefault(d, [])
+        if (label, css) not in events[d]:
+            events[d].append((label, css))
+
+    if sched is not None and not sched.empty:
+        for _, r in sched.iterrows():
+            if r.get("_cutoff") and r["_cutoff"] != "-":
+                _add(str(r["_cutoff"])[:10], f"🧾 발주마감 {cutt} · {r['제품명'][:8]}",
+                     "background:#FFE0B2;")
+            if r.get("_L") and r["_L"] != "-":
+                _add(r["_L"], f"🔄 교체납품 · {r['제품명'][:8]} → {r['매장'][:6]}",
+                     "background:#E3F2FD;")
+            _add(r["소비기한"], f"⏳ 소비기한 · {r['제품명'][:8]}", "background:#FFEBEE;")
+
+    stores_all = df_stores()
+    if not stores_all.empty:
+        import calendar as _cal
+        for week in _cal.Calendar().monthdatescalendar(year, month):
+            for d in week:
+                if d.month != month:
+                    continue
+                wd = KOR_WEEKDAY[d.weekday()]
+                for _, s in stores_all.iterrows():
+                    days = str(s["delivery_day"] or "").split(",")
+                    if wd in days or "매일" in days:
+                        _add(d.strftime("%Y-%m-%d"), f"🚚 {s['name'][:8]}",
+                             "background:#E8F5E9;")
+
+    st.markdown(build_calendar_html(year, month, events), unsafe_allow_html=True)
+    st.caption("🟩 정기 납품(매장) · 🟦 교체 납품(로트) · 🟧 발주마감 · 🟥 소비기한 · 주황 테두리 = 오늘")
+
+
 st.sidebar.title("📦 삼립 무인편의점 재고관리")
 page = st.sidebar.radio(
     "메뉴",
-    ["📊 대시보드", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "📅 교체·발주 일정", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"],
+    ["📊 대시보드", "📅 교체·발주 일정", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"],
     label_visibility="collapsed",
 )
 st.sidebar.caption(f"오늘: {TODAY()}")
@@ -212,6 +269,13 @@ if page == "📊 대시보드":
                 st.caption("입고 로트에서 출고량을 기한 빠른 순(FIFO)으로 차감한 뒤, 현재 재고(제품 관리 표에서 수동 수정한 값 포함)와 "
                            "합계가 일치하도록 자동 보정합니다. 일일기록의 소비기한 로트는 그대로 두고, 표에서 수동으로 조정한 차이는 '(수동조정분)' 행에 ±로 모입니다. 수동조정분을 일일기록(입고/출고)으로 옮겨 적으면 이 행은 0이 되어 사라집니다.")
 
+    # ── 교체·발주 달력 (대시보드) ──
+    _buf = int(get_setting("buffer_days", "2"))
+    _cutd = int(get_setting("cutoff_days", "2"))
+    _cutt = get_setting("cutoff_time", "11:30")
+    _sched = replacement_schedule(_buf, _cutd, _cutt)
+    render_schedule_calendar(_sched, _cutt, key_prefix="dash")
+
     st.markdown('<div class="sec-hdr blue">🚚 오늘의 알림</div>', unsafe_allow_html=True)
     if not prods.empty:
         _p = prods.copy()
@@ -281,8 +345,6 @@ if page == "📊 대시보드":
 
     st.subheader("오늘 기록")
     st.dataframe(tx_today.drop(columns=["id"]), use_container_width=True, hide_index=True)
-    st.subheader("오늘 변경이력")
-    st.dataframe(df_logs(today, today), use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════
@@ -312,9 +374,10 @@ elif page == "📝 일일 기록":
             box_qty = max(int(prow["box_qty"]), 1)
 
             c4, c5, c6, c7 = st.columns([1.2, 1, 1, 1.2])
-            store_names = ["(총량 / 매장 미지정)"] + stores["name"].tolist()
+            store_names = store_select_options(stores)
             sname = c4.selectbox("매장(납품처)", store_names,
-                                 help="매장별로 나눌 필요 없으면 '(총량)'을 선택")
+                                 help="개별 매장 / 🗺️ 지역 전체(인천·경기서울 등) / (총량) 중 선택. "
+                                      "지역 그룹은 [납품처 관리]의 '지역(그룹)' 칸에 입력하면 자동 생성")
             qty_box = c5.number_input("수량(박스)", min_value=0, step=1, value=0, key="in_box",
                                       help="박스만 입력해도 됩니다 → 낱개로 자동 환산")
             qty_ea = c6.number_input("수량(낱개)", min_value=0, step=1, value=0, key="in_ea",
@@ -343,13 +406,11 @@ elif page == "📝 일일 기록":
                     st.error("박스 또는 낱개 수량 중 하나 이상을 입력하세요.")
                 else:
                     pid = int(prow["id"])
-                    sid = None
-                    if sname != "(총량 / 매장 미지정)":
-                        sid = int(stores[stores["name"] == sname].iloc[0]["id"])
+                    sid, region = parse_store_choice(sname, stores)
                     ops = [(
-                        "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, expiry_date, memo, created_at) "
-                        "VALUES (:d, :p, :t, :s, :qb, :qe, :ex, :m, :c)",
-                        dict(d=tdate.strftime("%Y-%m-%d"), p=pid, t=ttype, s=sid,
+                        "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, region, expiry_date, memo, created_at) "
+                        "VALUES (:d, :p, :t, :s, :qb, :qe, :rg, :ex, :m, :c)",
+                        dict(d=tdate.strftime("%Y-%m-%d"), p=pid, t=ttype, s=sid, rg=region,
                              qb=int(qty_box), qe=int(qty_ea),
                              ex=exp_date.strftime("%Y-%m-%d") if exp_use else "",
                              m=memo, c=KST_NOW()))]
@@ -872,7 +933,7 @@ elif page == "🏬 납품처 관리(엑셀표)":
     st.title("🏬 납품처(매장) 관리 — 엑셀처럼 직접 수정")
     st.caption("셀을 터치/더블클릭해 수정하고 [저장]. 맨 아래 빈 줄에 입력하면 신규 매장 추가.")
     stores = df_stores()
-    grid_cols = ["id", "name", "location", "delivery_day", "phone", "memo", "note"]
+    grid_cols = ["id", "name", "region", "location", "delivery_day", "phone", "memo", "note"]
     grid = stores[grid_cols].copy() if not stores.empty else pd.DataFrame(columns=grid_cols)
     # DB의 "화,금" 문자열 → 다중선택용 리스트로 변환
     grid["delivery_day"] = grid["delivery_day"].apply(
@@ -883,6 +944,8 @@ elif page == "🏬 납품처 관리(엑셀표)":
         column_config={
             "id": st.column_config.NumberColumn("ID", width="small"),
             "name": st.column_config.TextColumn("매장명", required=True),
+            "region": st.column_config.TextColumn(
+                "지역(그룹)", help="일일기록에서 묶어 출고할 그룹명. 예: 인천 / 경기서울 — 같은 이름끼리 한 그룹"),
             "location": st.column_config.TextColumn("납품개소/주소"),
             "delivery_day": st.column_config.MultiselectColumn(
                 "납품요일", options=DAY_OPTIONS,
@@ -930,12 +993,13 @@ elif page == "🏬 납품처 관리(엑셀표)":
             ph = "" if pd.isna(r["phone"]) else str(r["phone"]).strip()
             mm = "" if pd.isna(r["memo"]) else str(r["memo"])
             nt = "" if pd.isna(r["note"]) else str(r["note"])
+            rg = "" if pd.isna(r["region"]) else str(r["region"]).strip()
             if pd.notna(r["id"]) and int(r["id"]) in old_map:
                 rid = int(r["id"]); seen.add(rid)
                 old = old_map[rid]
-                if (old["name"], old["location"], old["delivery_day"], old["phone"], old["memo"], old["note"]) != (nm, loc, dd, ph, mm, nt):
-                    ops.append(("UPDATE stores SET name=:n, location=:l, delivery_day=:d, phone=:p, memo=:m, note=:nt WHERE id=:i",
-                                dict(n=nm, l=loc, d=dd, p=ph, m=mm, nt=nt, i=rid)))
+                if (old["name"], old["location"], old["region"], old["delivery_day"], old["phone"], old["memo"], old["note"]) != (nm, loc, rg, dd, ph, mm, nt):
+                    ops.append(("UPDATE stores SET name=:n, location=:l, region=:rg, delivery_day=:d, phone=:p, memo=:m, note=:nt WHERE id=:i",
+                                dict(n=nm, l=loc, rg=rg, d=dd, p=ph, m=mm, nt=nt, i=rid)))
                     ops.append(log_op(f"[매장] {nm}", "매장정보",
                                       f"{old['name']} / {old['location']} / {old['delivery_day'] or '요일미지정'} / {old['phone'] or '번호없음'}",
                                       f"{nm} / {loc} / {dd or '요일미지정'} / {ph or '번호없음'}"))
@@ -944,8 +1008,8 @@ elif page == "🏬 납품처 관리(엑셀표)":
                     st.warning(f"'{nm}' 매장은 이미 존재합니다.")
                     continue
                 existing_store_names.add(nm)
-                ops.append(("INSERT INTO stores (name, location, delivery_day, phone, memo, note) VALUES (:n, :l, :d, :p, :m, :nt)",
-                            dict(n=nm, l=loc, d=dd, p=ph, m=mm, nt=nt)))
+                ops.append(("INSERT INTO stores (name, location, region, delivery_day, phone, memo, note) VALUES (:n, :l, :rg, :d, :p, :m, :nt)",
+                            dict(n=nm, l=loc, rg=rg, d=dd, p=ph, m=mm, nt=nt)))
                 ops.append(log_op(f"[매장] {nm}", "매장정보", "(신규등록)", f"{nm} / {loc} / {dd or '요일미지정'}"))
         for rid, old in old_map.items():
             if rid not in seen:
@@ -1229,60 +1293,9 @@ elif page == "📅 교체·발주 일정":
         st.dataframe(view.style.apply(_hl_sched, axis=1), use_container_width=True, hide_index=True)
         csv_button(view, "교체발주일정", "csv_sched")
 
-        # ── 달력 보기 ──
+        # ── 달력 보기 (공용 함수) ──
         st.divider()
-        st.subheader("🗓️ 달력 보기")
-        if "cal_offset" not in st.session_state:
-            st.session_state["cal_offset"] = 0
-        cprev, ctitle, cnext = st.columns([1, 3, 1])
-        if cprev.button("◀ 이전달", key="cal_prev"):
-            st.session_state["cal_offset"] -= 1
-            st.rerun()
-        if cnext.button("다음달 ▶", key="cal_next"):
-            st.session_state["cal_offset"] += 1
-            st.rerun()
-        base = today_kst().replace(day=15)
-        off = st.session_state["cal_offset"]
-        ym = base.month - 1 + off
-        year, month = base.year + ym // 12, ym % 12 + 1
-        ctitle.markdown(f"<h3 style='text-align:center'>{year}년 {month}월</h3>", unsafe_allow_html=True)
-
-        events = {}
-        def _add(dstr, label, css):
-            try:
-                d = pd.Timestamp(dstr).date()
-            except Exception:
-                return
-            events.setdefault(d, [])
-            if (label, css) not in events[d]:
-                events[d].append((label, css))
-
-        for _, r in sched.iterrows():
-            if r.get("_cutoff") and r["_cutoff"] != "-":
-                _add(str(r["_cutoff"])[:10], f"🧾 발주마감 {cutt} · {r['제품명'][:8]}",
-                     "background:#FFE0B2;")
-            if r.get("_L") and r["_L"] != "-":
-                _add(r["_L"], f"🔄 교체납품 · {r['제품명'][:8]} → {r['매장'][:6]}",
-                     "background:#E3F2FD;")
-            _add(r["소비기한"], f"⏳ 소비기한 · {r['제품명'][:8]}", "background:#FFEBEE;")
-
-        # 매장 정기 납품요일 표시
-        stores_all = df_stores()
-        if not stores_all.empty:
-            import calendar as _cal
-            for week in _cal.Calendar().monthdatescalendar(year, month):
-                for d in week:
-                    if d.month != month:
-                        continue
-                    wd = KOR_WEEKDAY[d.weekday()]
-                    for _, s in stores_all.iterrows():
-                        days = str(s["delivery_day"] or "").split(",")
-                        if wd in days or "매일" in days:
-                            _add(d.strftime("%Y-%m-%d"), f"🚚 {s['name'][:8]}",
-                                 "background:#E8F5E9;")
-
-        st.markdown(build_calendar_html(year, month, events), unsafe_allow_html=True)
-        st.caption("🟩 정기 납품(매장) · 🟦 교체 납품(로트) · 🟧 발주마감(11:30) · 🟥 소비기한 · 주황 테두리 = 오늘")
+        render_schedule_calendar(sched, cutt, key_prefix="sched")
 
 
 # ══════════════════════════════════════════════
