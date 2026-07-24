@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
     qty_box INTEGER DEFAULT 0,
     qty_ea INTEGER DEFAULT 0,
+    region TEXT DEFAULT '',
     expiry_date TEXT DEFAULT '',
     memo TEXT DEFAULT '',
     created_at TEXT
@@ -130,6 +131,14 @@ CREATE TABLE IF NOT EXISTS daily_memos (
     created_at TEXT,
     updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS change_logs (
     id SERIAL PRIMARY KEY,
     log_date TEXT NOT NULL,
@@ -142,7 +151,7 @@ CREATE TABLE IF NOT EXISTS change_logs (
 """
 
 
-SCHEMA_VERSION = 12  # ⚠️ 테이블/컬럼을 추가할 때마다 +1 하세요. 배포 시 자동으로 스키마가 갱신됩니다.
+SCHEMA_VERSION = 14  # ⚠️ 테이블/컬럼을 추가할 때마다 +1 하세요. 배포 시 자동으로 스키마가 갱신됩니다.
 
 
 @st.cache_resource
@@ -177,10 +186,14 @@ def get_engine(schema_version: int):
             c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS region TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS region TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
             c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE stores ADD COLUMN IF NOT EXISTS region TEXT DEFAULT ''"))
+            c.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS region TEXT DEFAULT ''"))
             c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
             c.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS safety_ea INTEGER DEFAULT 0"))
         return eng
@@ -450,6 +463,112 @@ def df_snapshots() -> pd.DataFrame:
            ORDER BY n.sdate, p.name""")
 
 
+def get_setting(key: str, default: str = "") -> str:
+    row = qdf("SELECT value FROM app_settings WHERE key = :k", k=key)
+    return row.iloc[0]["value"] if not row.empty else default
+
+
+def set_setting(key: str, value: str):
+    run("INSERT INTO app_settings (key, value) VALUES (:k, :v) "
+        "ON CONFLICT (key) DO UPDATE SET value = :v", k=key, v=str(value))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def replace_plan(buffer_days: int, lead_days: int) -> pd.DataFrame:
+    """소비기한 로트별 교체·발주 일정 계산.
+    교체마감 = 소비기한 - 여유일 / 마지막교체일 = 납품요일 중 교체마감 이전 마지막 날짜 /
+    발주마감 = 마지막교체일 - 리드타임. 납품요일은 제품에 연결된 매장들의 요일 합집합."""
+    from datetime import timedelta
+    bd = expiry_breakdown()
+    if bd.empty:
+        return pd.DataFrame()
+    dated = bd[bd["소비기한"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)].copy()
+    dated = dated[dated["잔여낱개환산"] > 0]
+    if dated.empty:
+        return pd.DataFrame()
+
+    ps = qdf("""SELECT p.name AS 제품명, s.name AS 매장명, s.delivery_day AS 요일
+                FROM product_stores x JOIN products p ON p.id = x.product_id
+                JOIN stores s ON s.id = x.store_id""")
+    day_idx = {d: i for i, d in enumerate(KOR_WEEKDAY)}
+    prod_days, prod_stores_txt = {}, {}
+    for pname, g in ps.groupby("제품명"):
+        days = set()
+        for v in g["요일"]:
+            for d in str(v or "").split(","):
+                if d == "매일":
+                    days |= set(range(7))
+                elif d in day_idx:
+                    days.add(day_idx[d])
+        prod_days[pname] = days
+        prod_stores_txt[pname] = ", ".join(
+            f"{r['매장명']}({r['요일'] or '요일미지정'})" for _, r in g.iterrows())
+
+    today = today_kst()
+    rows = []
+    for _, r in dated.iterrows():
+        pname = r["제품명"]
+        exp = pd.Timestamp(r["소비기한"]).date()
+        deadline = exp - timedelta(days=buffer_days)
+        days = prod_days.get(pname, set())
+        last_dlv = None
+        if days:
+            d = deadline
+            for _ in range(28):                      # 최대 4주 역탐색
+                if d.weekday() in days:
+                    last_dlv = d
+                    break
+                d -= timedelta(days=1)
+        order_due = (last_dlv - timedelta(days=lead_days)) if last_dlv else None
+
+        if last_dlv is None:
+            status = "⚪ 납품매장 미지정"
+        elif today > last_dlv:
+            status = "🚨 교체시기 지남"
+        elif order_due and today > order_due:
+            status = "🔴 발주마감 경과(직접 조율)"
+        elif order_due and today == order_due:
+            status = "🔥 오늘 발주 마감"
+        elif order_due and (order_due - today).days <= 3:
+            status = f"🟠 임박(D-{(order_due - today).days})"
+        else:
+            status = "🟢 여유"
+
+        rows.append(dict(
+            제품명=pname, 소비기한=str(exp), 잔여낱개환산=int(r["잔여낱개환산"]),
+            박스환산=r["박스환산"],
+            교체마감=str(deadline),
+            마지막교체일=(f"{last_dlv} ({KOR_WEEKDAY[last_dlv.weekday()]})" if last_dlv else "-"),
+            발주마감=(f"{order_due} ({KOR_WEEKDAY[order_due.weekday()]})" if order_due else "-"),
+            상태=status,
+            납품매장=prod_stores_txt.get(pname, "(미지정)"),
+            _last=str(last_dlv) if last_dlv else "", _order=str(order_due) if order_due else ""))
+    df = pd.DataFrame(rows)
+    return df.sort_values(["소비기한", "제품명"]).reset_index(drop=True)
+
+
+def store_select_options(stores: pd.DataFrame) -> list:
+    """일일기록 매장 선택 옵션: (총량) → 🗺️ 지역 전체 → 개별 매장"""
+    opts = ["(총량 / 매장 미지정)"]
+    if not stores.empty and "region" in stores.columns:
+        regions = sorted({str(r).strip() for r in stores["region"].fillna("") if str(r).strip()})
+        opts += [f"🗺️ {r} 전체" for r in regions]
+    if not stores.empty:
+        opts += stores["name"].tolist()
+    return opts
+
+
+def parse_store_choice(choice: str, stores: pd.DataFrame):
+    """선택값 → (store_id, region) 매핑"""
+    if choice.startswith("🗺️ ") and choice.endswith(" 전체"):
+        return None, choice[len("🗺️ "):-len(" 전체")].strip()
+    if choice != "(총량 / 매장 미지정)" and not stores.empty:
+        hit = stores[stores["name"] == choice]
+        if not hit.empty:
+            return int(hit.iloc[0]["id"]), ""
+    return None, ""
+
+
 def search_box(df: pd.DataFrame, key: str, label: str = "🔍 검색") -> pd.DataFrame:
     """표 위에 검색창을 붙이고, 입력어가 포함된 행만 반환 (모든 컬럼 대상, 대소문자 무시)"""
     q = st.text_input(label, key=key, placeholder="제품명·매장명 등 일부만 입력해도 검색됩니다")
@@ -533,7 +652,7 @@ def table_png(df: pd.DataFrame, day_col: str = "납품요일") -> bytes:
 def df_transactions(d1=None, d2=None) -> pd.DataFrame:
     q = """
         SELECT t.id, t.tdate AS 날짜, p.name AS 제품명, t.ttype AS 구분,
-               COALESCE(s.name,'(총량)') AS 매장, t.qty_box AS 박스, t.qty_ea AS 낱개,
+               COALESCE(s.name, CASE WHEN t.region <> '' THEN '(' || t.region || ' 전체)' ELSE '(총량)' END) AS 매장, t.qty_box AS 박스, t.qty_ea AS 낱개,
                (t.qty_box * GREATEST(p.box_qty, 1) + t.qty_ea) AS 총낱개환산,
                t.expiry_date AS 소비기한, t.memo AS 메모, t.created_at AS 기록시각
         FROM transactions t
@@ -712,3 +831,116 @@ def build_excel(d1=None, d2=None) -> bytes:
 # 사이드바 메뉴
 # ──────────────────────────────────────────────
 # 접속 시 오늘 재고 스냅샷 자동 저장 (세션당 1회)
+
+# ──────────────────────────────────────────────
+# 교체·발주 일정 (소비기한 역산)
+# ──────────────────────────────────────────────
+def get_setting(key: str, default: str) -> str:
+    df = qdf("SELECT value FROM app_settings WHERE key = :k", k=key)
+    return df.iloc[0]["value"] if not df.empty else default
+
+
+def set_setting(key: str, value: str):
+    run("""INSERT INTO app_settings (key, value) VALUES (:k, :v)
+           ON CONFLICT (key) DO UPDATE SET value = :v""", k=key, v=str(value))
+
+
+def _last_delivery_on_or_before(target: date, days: list) -> date | None:
+    """target 이전(포함) 가장 가까운 납품 가능일 (14일 내 탐색)"""
+    from datetime import timedelta
+    for i in range(0, 15):
+        d = target - timedelta(days=i)
+        if "매일" in days or KOR_WEEKDAY[d.weekday()] in days:
+            return d
+    return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def replacement_schedule(buffer_days: int, cutoff_days: int, cutoff_hm: str) -> pd.DataFrame:
+    """소비기한 로트별 교체·발주 일정 역산.
+    교체마감일 = 소비기한 − 여유일
+    마지막 교체 납품일 = 매장 납품요일 중 교체마감일 이전 마지막 날
+    발주마감 = 납품일 − cutoff_days, cutoff_hm(예: 11:30, KST)"""
+    from datetime import timedelta
+    bd = expiry_breakdown()
+    if bd.empty:
+        return pd.DataFrame()
+    dated = bd[bd["소비기한"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)].copy()
+    dated = dated[dated["잔여낱개환산"] > 0]
+    if dated.empty:
+        return pd.DataFrame()
+    ps = qdf("""SELECT p.name AS 제품명, s.name AS 매장명, s.delivery_day AS 요일
+                FROM product_stores x
+                JOIN products p ON p.id = x.product_id
+                JOIN stores s ON s.id = x.store_id""")
+    hh, mm = (int(x) for x in cutoff_hm.split(":"))
+    now = datetime.now(KST)
+    rows = []
+    for _, lot in dated.iterrows():
+        exp = pd.Timestamp(lot["소비기한"]).date()
+        R = exp - timedelta(days=int(buffer_days))                     # 교체마감일
+        maps = ps[ps["제품명"] == lot["제품명"]]
+        targets = ([(r["매장명"], [d for d in str(r["요일"] or "").split(",") if d])
+                    for _, r in maps.iterrows()] or [("(매장 미지정)", [])])
+        for store, days in targets:
+            if not days:
+                rows.append(dict(제품명=lot["제품명"], 소비기한=lot["소비기한"],
+                                 잔여낱개=int(lot["잔여낱개환산"]), 매장=store, 납품요일="",
+                                 교체마감일=R.strftime("%Y-%m-%d"), 마지막교체납품일="-",
+                                 발주마감="-", 상태="⚪ 납품요일 미지정"))
+                continue
+            L = _last_delivery_on_or_before(R, days)
+            if L is None:
+                continue
+            cutoff = datetime(L.year, L.month, L.day, hh, mm, tzinfo=KST) - timedelta(days=int(cutoff_days))
+            remain = cutoff - now
+            if L < now.date():
+                status = "🚨 교체시기 경과"
+            elif remain.total_seconds() < 0:
+                status = "⛔ 발주마감 지남 — 교체 불가 위험"
+            elif remain.total_seconds() <= 24 * 3600:
+                status = f"🔥 마감 임박 ({int(remain.total_seconds()//3600)}시간 남음)"
+            elif remain.days <= 3:
+                status = f"⏰ D-{remain.days + (1 if remain.seconds else 0)} 발주 필요"
+            else:
+                status = f"🟢 여유 (D-{remain.days})"
+            rows.append(dict(제품명=lot["제품명"], 소비기한=lot["소비기한"],
+                             잔여낱개=int(lot["잔여낱개환산"]), 매장=store,
+                             납품요일=",".join(days),
+                             교체마감일=R.strftime("%Y-%m-%d"),
+                             마지막교체납품일=f"{L.strftime('%Y-%m-%d')}({KOR_WEEKDAY[L.weekday()]})",
+                             발주마감=cutoff.strftime("%Y-%m-%d %H:%M"),
+                             상태=status, _cutoff=cutoff.strftime("%Y-%m-%d %H:%M"),
+                             _L=L.strftime("%Y-%m-%d")))
+    df = pd.DataFrame(rows)
+    if not df.empty and "_cutoff" in df.columns:
+        df = df.sort_values(["_cutoff", "제품명"], na_position="last")
+    return df
+
+
+def build_calendar_html(year: int, month: int, events: dict) -> str:
+    """월 달력 HTML. events: {date: [(label, color_css), ...]}"""
+    import calendar as _cal
+    cal = _cal.Calendar(firstweekday=0)  # 월요일 시작
+    today = today_kst()
+    head = "".join(f"<th>{d}</th>" for d in ["월", "화", "수", "목", "금",
+                                              "<span style='color:#4D96FF'>토</span>",
+                                              "<span style='color:#FF6B6B'>일</span>"])
+    body = ""
+    for week in cal.monthdatescalendar(year, month):
+        body += "<tr>"
+        for d in week:
+            dim = d.month != month
+            is_today = d == today
+            cell_style = "opacity:.35;" if dim else ""
+            if is_today:
+                cell_style += "outline:2px solid #FF6B35; outline-offset:-2px;"
+            items = ""
+            for label, css in events.get(d, []):
+                items += f"<div style='font-size:.72rem; margin:2px 0; padding:1px 5px; border-radius:6px; {css}'>{label}</div>"
+            body += (f"<td style='vertical-align:top; height:86px; border:1px solid rgba(128,128,128,.25); "
+                     f"padding:4px; {cell_style}'>"
+                     f"<div style='font-weight:700; font-size:.85rem;'>{d.day}</div>{items}</td>")
+        body += "</tr>"
+    return (f"<table style='width:100%; border-collapse:collapse; table-layout:fixed;'>"
+            f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")

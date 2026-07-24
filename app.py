@@ -51,7 +51,7 @@ if not st.session_state.get("snapshot_done"):
 st.sidebar.title("📦 삼립 무인편의점 재고관리")
 page = st.sidebar.radio(
     "메뉴",
-    ["📊 대시보드", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"],
+    ["📊 대시보드", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "📅 교체·발주 일정", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"],
     label_visibility="collapsed",
 )
 st.sidebar.caption(f"오늘: {TODAY()}")
@@ -379,7 +379,7 @@ elif page == "📝 일일 기록":
             st.caption("아래 표에 행을 추가하며 여러 제품을 한 번에 입력하세요. 저장 전에도 [발주서 CSV]로 내보내 발주 담당자에게 전달할 수 있습니다.")
             bdate = st.date_input("날짜 (모든 행에 일괄 적용)", value=today_kst(), key="bulk_date")
 
-            store_opts = ["(총량 / 매장 미지정)"] + stores["name"].tolist()
+            store_opts = store_select_options(stores)
             bulk_empty = pd.DataFrame({
                 "제품명": pd.Series(dtype="object"),
                 "구분": pd.Series(dtype="object"),
@@ -441,20 +441,19 @@ elif page == "📝 일일 기록":
                     if not bad.empty:
                         st.error(f"수량이 0인 행이 {len(bad)}건 있습니다. 박스 또는 낱개를 입력하세요.")
                     else:
-                        sid_map = dict(zip(stores["name"], stores["id"]))
                         prow_map = {r["name"]: r for _, r in prods.iterrows()}
                         ops = []
                         stock_delta = {}  # pid → 환산낱개 변화 합 (입고+, 출고-)
                         for _, r in valid.iterrows():
                             pr = prow_map[r["제품명"]]
                             pid = int(pr["id"])
-                            sid = sid_map.get(r["매장"]) if r["매장"] in sid_map else None
+                            sid, region = parse_store_choice(str(r["매장"]), stores)
                             ex = "" if pd.isna(r["소비기한"]) else pd.Timestamp(r["소비기한"]).strftime("%Y-%m-%d")
                             ops.append((
-                                "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, expiry_date, memo, created_at) "
-                                "VALUES (:d, :p, :t, :s, :qb, :qe, :ex, :m, :c)",
+                                "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, region, expiry_date, memo, created_at) "
+                                "VALUES (:d, :p, :t, :s, :qb, :qe, :rg, :ex, :m, :c)",
                                 dict(d=bdate.strftime("%Y-%m-%d"), p=pid, t=r["구분"],
-                                     s=int(sid) if sid is not None else None,
+                                     s=sid, rg=region,
                                      qb=int(r["박스"]), qe=int(r["낱개"]), ex=ex, m=r["메모"], c=KST_NOW())))
                             if r["구분"] in ("입고", "출고"):
                                 sign = 1 if r["구분"] == "입고" else -1
@@ -894,7 +893,7 @@ elif page == "🏬 납품처 관리(엑셀표)":
             "memo": st.column_config.TextColumn("메모"),
             "note": st.column_config.TextColumn("특이사항"),
         }, key="store_editor")
-    export_df = grid.rename(columns={"name": "매장명", "location": "납품개소",
+    export_df = grid.rename(columns={"name": "매장명", "region": "지역", "location": "납품개소",
                                      "delivery_day": "납품요일", "phone": "점주전화번호",
                                      "memo": "메모", "note": "특이사항"}).copy()
     export_df["납품요일"] = export_df["납품요일"].apply(
@@ -1178,6 +1177,112 @@ elif page == "📋 납품 정리표(매장×제품)":
                                        aggfunc="sum", fill_value=0)
                 st.caption("행=제품, 열=매장, 값=수량(박스)")
                 st.dataframe(mat, use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+# 교체·발주 일정 — 소비기한 역산 + 달력
+# ══════════════════════════════════════════════
+elif page == "📅 교체·발주 일정":
+    st.title("📅 교체·발주 일정 (소비기한 역산)")
+    st.caption("소비기한 → 교체마감일 → 마지막 교체 납품일(매장 요일) → 발주마감(D-2 · 11:30 KST)을 자동 계산합니다.")
+
+    with st.expander("⚙️ 기준 설정", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        buf = c1.number_input("여유일 (소비기한 며칠 전까지 교체)", 0, 30,
+                              int(get_setting("buffer_days", "2")), key="set_buf")
+        cutd = c2.number_input("발주 마감 (납품일 며칠 전)", 0, 14,
+                               int(get_setting("cutoff_days", "2")), key="set_cutd")
+        cutt = c3.text_input("발주 마감 시각 (HH:MM, 한국시간)",
+                             get_setting("cutoff_time", "11:30"), key="set_cutt")
+        if st.button("💾 설정 저장", key="set_save"):
+            set_setting("buffer_days", int(buf))
+            set_setting("cutoff_days", int(cutd))
+            set_setting("cutoff_time", cutt.strip() or "11:30")
+            clear_cache()
+            st.success("설정 저장 완료")
+            st.rerun()
+
+    buf = int(get_setting("buffer_days", "2"))
+    cutd = int(get_setting("cutoff_days", "2"))
+    cutt = get_setting("cutoff_time", "11:30")
+    st.info(f"현재 기준: 소비기한 **{buf}일 전**까지 교체 · 발주는 납품일 **{cutd}일 전 {cutt}(KST)** 까지 "
+            f"(예: 인천 월·목 / 경기서울 화·금 납품)")
+
+    sched = replacement_schedule(buf, cutd, cutt)
+    if sched.empty:
+        st.info("소비기한이 입력된 재고 로트가 없거나, 제품에 납품 매장이 지정되지 않았습니다. "
+                "[제품 관리 → 상세 → 납품 매장]과 [납품처 관리 → 납품요일]을 설정하세요.")
+    else:
+        view = sched.drop(columns=["_cutoff", "_L"], errors="ignore")
+        view = search_box(view, "search_sched", "🔍 제품·매장 검색")
+
+        def _hl_sched(row):
+            s = str(row["상태"])
+            if s.startswith(("🚨", "⛔")):
+                return ["background-color: #FFEBEE"] * len(row)
+            if s.startswith("🔥"):
+                return ["background-color: #FFE0B2"] * len(row)
+            if s.startswith("⏰"):
+                return ["background-color: #FFF8E1"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(view.style.apply(_hl_sched, axis=1), use_container_width=True, hide_index=True)
+        csv_button(view, "교체발주일정", "csv_sched")
+
+        # ── 달력 보기 ──
+        st.divider()
+        st.subheader("🗓️ 달력 보기")
+        if "cal_offset" not in st.session_state:
+            st.session_state["cal_offset"] = 0
+        cprev, ctitle, cnext = st.columns([1, 3, 1])
+        if cprev.button("◀ 이전달", key="cal_prev"):
+            st.session_state["cal_offset"] -= 1
+            st.rerun()
+        if cnext.button("다음달 ▶", key="cal_next"):
+            st.session_state["cal_offset"] += 1
+            st.rerun()
+        base = today_kst().replace(day=15)
+        off = st.session_state["cal_offset"]
+        ym = base.month - 1 + off
+        year, month = base.year + ym // 12, ym % 12 + 1
+        ctitle.markdown(f"<h3 style='text-align:center'>{year}년 {month}월</h3>", unsafe_allow_html=True)
+
+        events = {}
+        def _add(dstr, label, css):
+            try:
+                d = pd.Timestamp(dstr).date()
+            except Exception:
+                return
+            events.setdefault(d, [])
+            if (label, css) not in events[d]:
+                events[d].append((label, css))
+
+        for _, r in sched.iterrows():
+            if r.get("_cutoff") and r["_cutoff"] != "-":
+                _add(str(r["_cutoff"])[:10], f"🧾 발주마감 {cutt} · {r['제품명'][:8]}",
+                     "background:#FFE0B2;")
+            if r.get("_L") and r["_L"] != "-":
+                _add(r["_L"], f"🔄 교체납품 · {r['제품명'][:8]} → {r['매장'][:6]}",
+                     "background:#E3F2FD;")
+            _add(r["소비기한"], f"⏳ 소비기한 · {r['제품명'][:8]}", "background:#FFEBEE;")
+
+        # 매장 정기 납품요일 표시
+        stores_all = df_stores()
+        if not stores_all.empty:
+            import calendar as _cal
+            for week in _cal.Calendar().monthdatescalendar(year, month):
+                for d in week:
+                    if d.month != month:
+                        continue
+                    wd = KOR_WEEKDAY[d.weekday()]
+                    for _, s in stores_all.iterrows():
+                        days = str(s["delivery_day"] or "").split(",")
+                        if wd in days or "매일" in days:
+                            _add(d.strftime("%Y-%m-%d"), f"🚚 {s['name'][:8]}",
+                                 "background:#E8F5E9;")
+
+        st.markdown(build_calendar_html(year, month, events), unsafe_allow_html=True)
+        st.caption("🟩 정기 납품(매장) · 🟦 교체 납품(로트) · 🟧 발주마감(11:30) · 🟥 소비기한 · 주황 테두리 = 오늘")
 
 
 # ══════════════════════════════════════════════
