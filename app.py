@@ -188,7 +188,7 @@ if page == "📊 대시보드":
     # 소비기한별 잔여 수량 분해 (입고 로트 기준, 출고는 기한 빠른 순 차감)
     if not bd.empty:
         with st.expander("📦 소비기한별 수량 — 일일기록 기준", expanded=True):
-            tab_raw, tab_calc = st.tabs(["📄 일일기록 그대로 (입력값)", "🧮 잔여 계산 (출고·수동조정 반영)"])
+            tab_raw, tab_calc = st.tabs(["📄 일일기록 로트 + 현재 잔여", "🧮 잔여 계산 (소비기한별 합산)"])
 
             # ── 탭1: 일일 기록에서 입력한 값을 아무 가공 없이 그대로 표시 ──
             with tab_raw:
@@ -203,9 +203,25 @@ if page == "📊 대시보드":
                 if raw.empty:
                     st.info("일일 기록에서 소비기한과 함께 입고를 입력하면 여기에 그대로 표시됩니다.")
                 else:
+                    # ── 현재 잔여 배분: 잔여계산(제품관리 재고 수정·출고 반영) 결과를
+                    #    같은 소비기한의 입고 기록에 오래된 것부터 소진된 것으로 배분 ──
+                    left_map = {}
+                    if not bd.empty:
+                        for _, _r in bd.iterrows():
+                            left_map[(_r["제품명"], _r["소비기한"])] = int(_r["잔여낱개환산"])
+                    raw["현재잔여"] = 0
+                    for (_pn, _ex), _g in raw.groupby(["제품명", "소비기한"], sort=False):
+                        _left = left_map.get((_pn, _ex), 0)
+                        _consumed = max(int(_g["환산낱개"].sum()) - _left, 0)
+                        for _idx in _g.sort_values(["입고일"]).index:  # 오래된 입고분부터 소진 처리
+                            _q = int(raw.at[_idx, "환산낱개"])
+                            _take = min(_q, _consumed)
+                            _consumed -= _take
+                            raw.at[_idx, "현재잔여"] = _q - _take
                     raw["디데이"] = raw["소비기한"].apply(
                         lambda e: (lambda dd: f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY"))(
                             (pd.Timestamp(e).date() - today_kst()).days))
+                    raw = raw[["입고일", "제품명", "소비기한", "박스", "낱개", "환산낱개", "현재잔여", "디데이", "메모"]]
                     def _hl_raw(row):
                         try:
                             dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
@@ -219,11 +235,21 @@ if page == "📊 대시보드":
                     raw_view = search_box(raw, "search_raw_exp", "🔍 제품명 검색")
                     st.dataframe(raw_view.style.apply(_hl_raw, axis=1),
                                  use_container_width=True, hide_index=True)
-                    tot = raw_view.groupby("제품명", as_index=False)["환산낱개"].sum()
-                    st.caption("제품별 입고 합계(환산낱개): " + " · ".join(
-                        f"**{r['제품명']}** {int(r['환산낱개']):,}" for _, r in tot.iterrows()))
-                    csv_button(raw_view, "소비기한_일일기록그대로", "csv_raw_exp")
-                    st.caption("일일 기록에 입력한 입고 로트를 날짜·소비기한·수량 그대로 보여줍니다 (출고 차감 없음).")
+                    tot = raw_view.groupby("제품명", as_index=False).agg(
+                        입고합=("환산낱개", "sum"), 잔여합=("현재잔여", "sum"))
+                    manual_note = ""
+                    if not bd.empty:
+                        _mn = bd[bd["소비기한"] == "(수동조정분)"]
+                        if not _mn.empty:
+                            manual_note = " | 수동조정분: " + " · ".join(
+                                f"{r['제품명']} {int(r['잔여낱개환산']):+,}" for _, r in _mn.iterrows())
+                    st.caption("제품별 [입고합 → 현재잔여]: " + " · ".join(
+                        f"**{r['제품명']}** {int(r['입고합']):,}→{int(r['잔여합']):,}"
+                        for _, r in tot.iterrows()) + manual_note)
+                    csv_button(raw_view, "소비기한_일일기록_잔여", "csv_raw_exp")
+                    st.caption("'환산낱개'는 입력한 그대로, '현재잔여'는 출고와 제품 관리(엑셀표) 재고 수정을 반영해 "
+                               "이 로트에서 지금 남은 수량입니다 (오래된 입고분부터 소진 처리). "
+                               "표에서 수동으로 넣은 재고는 소비기한을 알 수 없어 '수동조정분'으로 따로 집계됩니다.")
 
             # ── 탭2: 잔여 계산 (기존 로직: 출고·수동조정 반영, 합계=현재고) ──
             with tab_calc:
