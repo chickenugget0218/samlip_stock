@@ -211,9 +211,24 @@ def open_day_dialog(dsel: str):
             st.rerun()
 
 
+@st.fragment
 def render_schedule_calendar(sched: pd.DataFrame, cutt: str, key_prefix: str = "cal"):
     """클릭형 교체·발주 달력: 날짜를 누르면 그날 기록을 추가/수정/삭제하는 모달이 열립니다."""
-    st.subheader("🗓️ 교체·발주 달력 — 날짜를 클릭하면 기록 관리 팝업")
+    st.subheader("🗓️ 교체·발주 달력")
+    st.markdown(f"""
+    <style>
+    .st-key-{key_prefix}_calwrap div[data-testid="stButton"] > button {{
+        height: 52px; border-radius: 12px; font-weight: 800; font-size: 1.02rem;
+        border: 1px solid rgba(128,128,128,.25);
+    }}
+    .st-key-{key_prefix}_calwrap div[data-testid="stButton"] > button:disabled {{
+        opacity: 0; pointer-events: none;
+    }}
+    .st-key-{key_prefix}_calwrap div[data-testid="stCaptionContainer"] {{
+        text-align: center; margin-top: -6px; min-height: 20px; font-size: .72rem;
+    }}
+    .st-key-{key_prefix}_calwrap [data-testid="column"] {{ padding: 0 3px; }}
+    </style>""", unsafe_allow_html=True)
     okey = f"{key_prefix}_cal_offset"
     if okey not in st.session_state:
         st.session_state[okey] = 0
@@ -261,12 +276,15 @@ def render_schedule_calendar(sched: pd.DataFrame, cutt: str, key_prefix: str = "
                     if wd in days or "매일" in days:
                         _bump(d.strftime("%Y-%m-%d"), "🚚")
 
-    hdr = st.columns(7)
+    calwrap = st.container(key=f"{key_prefix}_calwrap")
+    hdr = calwrap.columns(7)
     for i, nm in enumerate(["월", "화", "수", "목", "금", "토", "일"]):
-        hdr[i].markdown(f"<div style='text-align:center;font-weight:700'>{nm}</div>", unsafe_allow_html=True)
+        color = "#4D96FF" if nm == "토" else "#FF6B6B" if nm == "일" else "inherit"
+        hdr[i].markdown(f"<div style='text-align:center;font-weight:800;color:{color}'>{nm}</div>",
+                        unsafe_allow_html=True)
     today = today_kst()
     for week in weeks:
-        cols = st.columns(7)
+        cols = calwrap.columns(7)
         for i, d in enumerate(week):
             with cols[i]:
                 if d.month != month:
@@ -275,23 +293,33 @@ def render_schedule_calendar(sched: pd.DataFrame, cutt: str, key_prefix: str = "
                     continue
                 btype = "primary" if d == today else "secondary"
                 if st.button(f"{d.day}", key=f"{key_prefix}_day_{d}", type=btype, use_container_width=True):
-                    open_day_dialog(d.strftime("%Y-%m-%d"))
+                    st.session_state["_open_day"] = d.strftime("%Y-%m-%d")
+                    st.rerun(scope="app")
                 badges = ev.get(d, {})
                 txt = " ".join(f"{k}{v}" for k, v in badges.items() if v)
                 st.caption(txt if txt else " ")
     st.caption("🚚 정기납품 · 🔄 교체납품 · 🧾 발주마감 · ⏳ 소비기한 — 날짜 버튼을 누르면 그날의 기록을 팝업에서 바로 추가·수정·삭제할 수 있습니다.")
 
 
+# 달력(fragment)에서 클릭된 날짜의 모달을 앱 레벨에서 오픈
+if st.session_state.get("_open_day"):
+    _d = st.session_state.pop("_open_day")
+    open_day_dialog(_d)
+
 st.sidebar.title("📦 삼립 무인편의점 재고관리")
-page = st.sidebar.radio(
-    "메뉴",
-    ["📊 대시보드", "📅 교체·발주 일정", "📝 일일 기록", "📈 일자별 누적(수불부)", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"],
-    label_visibility="collapsed",
-)
-st.sidebar.caption(f"오늘: {TODAY()}")
-if st.sidebar.button("🔓 로그아웃"):
-    st.session_state["authenticated"] = False
-    st.rerun()
+_CORE_PAGES = ["📊 대시보드", "📅 교체·발주 일정", "📝 일일 기록", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)"]
+_EXTRA_PAGES = ["📈 일자별 누적(수불부)", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"]
+
+
+def _reset_extra():
+    st.session_state["nav_extra"] = "(선택 안 함)"
+
+
+sel_main = st.sidebar.radio("메뉴", _CORE_PAGES, key="nav_main", on_change=_reset_extra)
+with st.sidebar.expander("📁 기타 (수불부·메모·이력·엑셀)"):
+    sel_extra = st.radio("기타 메뉴", ["(선택 안 함)"] + _EXTRA_PAGES, key="nav_extra",
+                         label_visibility="collapsed")
+page = sel_extra if sel_extra != "(선택 안 함)" else sel_main
 
 
 # ══════════════════════════════════════════════
