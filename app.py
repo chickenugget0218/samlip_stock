@@ -334,9 +334,8 @@ st.sidebar.title("📦 삼립 무인편의점")
 #  ① 오늘 할 일  ② 입출고(로트 자동반영)  ③ 재고 현황  ④ 메모
 _MAIN = {
     "🏠 오늘 할 일 (달력·발주)": "📊 대시보드",
-    "📅 격자표 (제품×날짜)": "📅 격자표",
-    "🔄 입출고 (입고·출고·반품·교체)": "📝 일일 기록",
     "📅 월별 격자표 (제품×날짜)": "📅 월별 격자표",
+    "🔄 입출고 (입고·출고·반품·교체)": "📝 일일 기록",
     "📦 재고 현황 (제품·소비기한)": "📦 재고 현황",
     "🗒️ 메모": "🗒️ 일자별 메모",
 }
@@ -970,6 +969,11 @@ elif page == "📅 월별 격자표":
     gy, gm = map(int, st.session_state["grid_ym"].split("-"))
     ct.markdown(f"<h3 style='text-align:center'>{gy}년 {gm}월</h3>", unsafe_allow_html=True)
 
+    if "month_grid" not in globals():
+        st.error("⚠️ core.py 가 예전 버전이라 격자표를 만들 수 없습니다. "
+                 "**app.py 와 core.py 를 함께** 최신으로 올린 뒤 ⋮ → Reboot app 하세요.")
+        st.stop()
+
     pivot, days, dtot, meta = month_grid(gy, gm)
     if pivot is None or pivot.empty:
         st.info("제품이 없습니다. [설정·관리 → 제품 관리]에서 먼저 등록하세요.")
@@ -1033,6 +1037,11 @@ elif page == "📅 월별 격자표":
             open_day_dialog(pick_day.strftime("%Y-%m-%d"))
 
 
+# ══════════════════════════════════════════════
+# 재고 현황 — 제품별 재고(로트 합계) + 소비기한 로트
+# ══════════════════════════════════════════════
+elif page == "📦 재고 현황":
+    st.title("📦 재고 현황")
     st.caption("재고는 소비기한 로트의 합계입니다. 수량 조정은 [입출고]에서 출고/입고로, 세부 로트는 [제품 관리 → 로트 직접 편집]에서.")
 
     prods = df_products()
