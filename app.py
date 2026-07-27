@@ -394,7 +394,7 @@ if page == "📊 대시보드":
     if not bd.empty:
         with st.expander("📦 소비기한별 수량 — 일일기록 기준", expanded=True):
             c_ts, c_rf = st.columns([4, 1])
-            c_ts.caption(f"계산 기준: {KST_NOW()} (KST) · 저장 직후 자동 갱신되며, 숫자가 이상하면 새로고침을 눌러주세요.")
+            c_ts.caption(f"계산 기준: {KST_NOW()} (KST) · 로직 {LOGIC_VERSION} · 숫자가 이상하면 새로고침을 눌러주세요.")
             if c_rf.button("🔄 새로고침", key="exp_refresh", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
@@ -435,16 +435,22 @@ if page == "📊 대시보드":
                     def _hl_raw(row):
                         try:
                             dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
+                            base = ("background-color: #FFEBEE" if dd < 0
+                                    else "background-color: #FFF8E1" if dd <= 30 else "")
                         except Exception:
-                            return [""] * len(row)
-                        if dd < 0:
-                            return ["background-color: #FFEBEE"] * len(row)
-                        if dd <= 30:
-                            return ["background-color: #FFF8E1"] * len(row)
-                        return [""] * len(row)
+                            base = ""
+                        styles = [base] * len(row)
+                        # '현재잔여'는 기준 열 → 파란 강조로 덮어쓰기
+                        ci = list(row.index).index("현재잔여")
+                        styles[ci] = "background-color: #1E88E5; color: #ffffff; font-weight: 800;"
+                        return styles
                     raw_view = search_box(raw, "search_raw_exp", "🔍 제품명 검색")
-                    st.dataframe(raw_view.style.apply(_hl_raw, axis=1),
-                                 use_container_width=True, hide_index=True)
+                    styled = (raw_view.style.apply(_hl_raw, axis=1)
+                              .set_properties(subset=["현재잔여"],
+                                              **{"background-color": "#1565C0", "color": "white",
+                                                 "font-weight": "800"}))
+                    st.dataframe(styled, use_container_width=True, hide_index=True,
+                                 column_config={"현재잔여": st.column_config.NumberColumn("🔵 현재잔여")})
                     tot = raw_view.groupby("제품명", as_index=False).agg(
                         입고합=("환산낱개", "sum"), 잔여합=("현재잔여", "sum"))
                     manual_note = ""
@@ -488,8 +494,11 @@ if page == "📊 대시보드":
                 pick_p = st.selectbox("제품 필터", ["(전체)"] + sorted(bd["제품명"].unique()), key="exp_pick")
                 show = bd if pick_p == "(전체)" else bd[bd["제품명"] == pick_p]
                 show = search_box(show, "search_expiry", "🔍 제품명 검색")
-                st.dataframe(show.style.apply(_hl_exp, axis=1),
-                             use_container_width=True, hide_index=True)
+                _st2 = (show.style.apply(_hl_exp, axis=1)
+                        .set_properties(subset=["잔여낱개환산"],
+                                        **{"background-color": "#1565C0", "color": "white",
+                                           "font-weight": "800"}))
+                st.dataframe(_st2, use_container_width=True, hide_index=True)
                 if pick_p != "(전체)":
                     st.caption(f"**{pick_p}** 잔여 합계: **{int(show['잔여낱개환산'].sum()):,}낱개** "
                                f"(현재 재고: {int(chk[chk['제품명']==pick_p]['현재재고(낱개환산)'].iloc[0]):,}낱개)")

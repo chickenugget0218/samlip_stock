@@ -151,7 +151,8 @@ CREATE TABLE IF NOT EXISTS change_logs (
 """
 
 
-SCHEMA_VERSION = 14  # ⚠️ 테이블/컬럼을 추가할 때마다 +1 하세요. 배포 시 자동으로 스키마가 갱신됩니다.
+SCHEMA_VERSION = 14
+LOGIC_VERSION = "v14-FEFO"  # 계산 로직 버전 (배포된 core.py 확인용 · 화면 표시)  # ⚠️ 테이블/컬럼을 추가할 때마다 +1 하세요. 배포 시 자동으로 스키마가 갱신됩니다.
 
 
 @st.cache_resource
