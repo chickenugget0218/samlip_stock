@@ -43,6 +43,8 @@ if not check_password():
 
 # ── 로그인 후에만 DB 연결·백엔드 로딩 (core.py) ──
 from core import *  # noqa: E402,F401,F403
+from core import (SCHEMA_VERSION, LOGIC_VERSION, KST_NOW, TODAY, today_kst,
+                  KOR_WEEKDAY, DAY_OPTIONS, DAY_COLORS, TTYPE_OPTIONS)  # 상수 명시 import
 
 if not st.session_state.get("snapshot_done"):
     snapshot_today()
