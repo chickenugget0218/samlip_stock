@@ -43,8 +43,15 @@ if not check_password():
 
 # ── 로그인 후에만 DB 연결·백엔드 로딩 (core.py) ──
 from core import *  # noqa: E402,F401,F403
-from core import (SCHEMA_VERSION, LOGIC_VERSION, KST_NOW, TODAY, today_kst,
-                  KOR_WEEKDAY, DAY_OPTIONS, DAY_COLORS, TTYPE_OPTIONS, fmt_stock_ea)  # 상수 명시 import
+
+# 두 파일(app.py + core.py) 버전이 어긋나면 여기서 친절히 안내 (조용한 오류 방지)
+_need = ["SCHEMA_VERSION", "LOGIC_VERSION", "KST_NOW", "TODAY", "today_kst",
+         "KOR_WEEKDAY", "DAY_OPTIONS", "DAY_COLORS", "TTYPE_OPTIONS", "fmt_stock_ea"]
+_missing = [n for n in _need if n not in dir()]
+if _missing:
+    st.error("⚠️ core.py 가 예전 버전입니다. app.py 와 core.py 를 **함께** 최신으로 올려주세요.\n\n"
+             f"현재 core.py 에 없는 항목: {', '.join(_missing)}")
+    st.stop()
 
 if not st.session_state.get("snapshot_done"):
     migrate_to_lots_once()   # 기존 재고/거래 → 로트 1회 이관
