@@ -44,9 +44,10 @@ if not check_password():
 # ── 로그인 후에만 DB 연결·백엔드 로딩 (core.py) ──
 from core import *  # noqa: E402,F401,F403
 from core import (SCHEMA_VERSION, LOGIC_VERSION, KST_NOW, TODAY, today_kst,
-                  KOR_WEEKDAY, DAY_OPTIONS, DAY_COLORS, TTYPE_OPTIONS)  # 상수 명시 import
+                  KOR_WEEKDAY, DAY_OPTIONS, DAY_COLORS, TTYPE_OPTIONS, fmt_stock_ea)  # 상수 명시 import
 
 if not st.session_state.get("snapshot_done"):
+    migrate_to_lots_once()   # 기존 재고/거래 → 로트 1회 이관
     snapshot_today()
     st.session_state["snapshot_done"] = True
 
@@ -164,9 +165,8 @@ def open_day_dialog(dsel: str):
                 if (str(o["제품명"]), o["구분"], int(o["박스"]), int(o["낱개"]),
                         str(o["소비기한"] or ""), str(o["메모"] or ""), o_sid, str(o["region"] or "")) != (
                         str(r["제품명"]), tt, qb, qe, ex, mm, sid, region):
-                    old_pid = int(o["product_id"])
-                    deltas[old_pid] = deltas.get(old_pid, 0) - _eff(o["구분"], int(o["박스"]), int(o["낱개"]), o_bq)
-                    deltas[pid] = deltas.get(pid, 0) + _eff(tt, qb, qe, bq)
+                    _revert(o)
+                    _apply(pid, tt, qb, qe, bq, ex)
                     ops.append(("UPDATE transactions SET product_id=:p, ttype=:t, store_id=:s, region=:rg, "
                                 "qty_box=:qb, qty_ea=:qe, expiry_date=:ex, memo=:m WHERE id=:i",
                                 dict(p=pid, t=tt, s=sid, rg=region, qb=qb, qe=qe, ex=ex, m=mm, i=rid)))
@@ -177,7 +177,7 @@ def open_day_dialog(dsel: str):
             else:                                           # 신규 행
                 if qb == 0 and qe == 0:
                     continue
-                deltas[pid] = deltas.get(pid, 0) + _eff(tt, qb, qe, bq)
+                _apply(pid, tt, qb, qe, bq, ex)
                 ops.append(("INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, "
                             "region, expiry_date, memo, created_at) VALUES (:d,:p,:t,:s,:qb,:qe,:rg,:ex,:m,:c)",
                             dict(d=dsel, p=pid, t=tt, s=sid, qb=qb, qe=qe, rg=region, ex=ex, m=mm, c=KST_NOW())))
@@ -186,28 +186,35 @@ def open_day_dialog(dsel: str):
 
         for rid, o in old_map.items():                       # 삭제된 행: 재고 복원
             if rid not in seen:
-                o_pid = int(o["product_id"])
-                o_bq = bq_of(prow_map.get(str(o["제품명"]), {"box_qty": 1})["box_qty"]) if str(o["제품명"]) in prow_map else 1
-                deltas[o_pid] = deltas.get(o_pid, 0) - _eff(o["구분"], int(o["박스"]), int(o["낱개"]), o_bq)
+                _revert(o)
                 ops.append(("DELETE FROM transactions WHERE id=:i", {"i": rid}))
                 ops.append(log_op(str(o["제품명"]), "기록삭제", f"#{rid} {o['구분']} {o['박스']}박스 {o['낱개']}낱개", "(달력에서 삭제)"))
                 n_chg += 1
 
-        # 제품별 재고 델타 반영 (박스/낱개 재배분)
-        for pid, delta in deltas.items():
-            if delta == 0:
-                continue
-            pr = [p for p in prow_map.values() if int(p["id"]) == pid][0]
-            bq = bq_of(pr["box_qty"])
-            total = int(pr["stock_box"]) * bq + int(pr["stock_ea"]) + delta
-            nb, ne = (total // bq, total % bq) if total >= 0 else (0, total)
-            ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
-                        dict(b=nb, e=ne, u=KST_NOW(), i=pid)))
+        # 로트 연산 수집: 기존 행은 (되돌림 + 새 반영), 신규는 반영, 삭제는 되돌림
+        # _eff 부호: 입고+ / 출고- . 로트에는 '입고 취소=consume, 출고 취소=add' 로 반영.
+        lot_ops = []  # (pid, expiry, qty_signed)  qty_signed>0 → lot_add, <0 → lot_consume
+
+        def _revert(o):
+            e = _eff(o["구분"], int(o["박스"]), int(o["낱개"]),
+                     bq_of(prow_map.get(str(o["제품명"]), {"box_qty": 1}).get("box_qty", 1)))
+            # 입고였으면(+) 되돌림은 로트 차감(-), 출고였으면(-) 되돌림은 로트 추가(+)
+            lot_ops.append((int(o["product_id"]), str(o["소비기한"] or ""), -e))
+
+        def _apply(pid, tt, qb, qe, bq, ex):
+            e = _eff(tt, qb, qe, bq)
+            lot_ops.append((pid, ex, e))
+
 
         if n_chg == 0:
             st.info("변경된 내용이 없습니다.")
         else:
             run_batch(ops)
+            for _pid, _ex, _q in lot_ops:      # 로트 반영 (재고 = 로트 합계)
+                if _q > 0:
+                    lot_add(_pid, _ex, _q, dsel)
+                elif _q < 0:
+                    lot_consume(_pid, -_q, _ex)
             clear_cache(f"day_editor_{dsel}")
             st.success(f"✅ {dsel} · {n_chg}건 반영 완료")
             st.rerun()
@@ -530,11 +537,10 @@ if page == "📊 대시보드":
         low = _p[(_p["safety_ea"] > 0) & (_p["총낱개환산"] < _p["safety_ea"])]
         if not low.empty:
             st.error(f"⚠️ 안전재고 미달 제품 {len(low)}개 — 발주 검토 필요")
-            st.dataframe(
-                low[["name", "stock_box", "stock_ea", "총낱개환산", "safety_ea"]].rename(columns={
-                    "name": "제품명", "stock_box": "현재고(박스)", "stock_ea": "현재고(낱개)",
-                    "safety_ea": "안전재고(낱개환산)"}),
-                use_container_width=True, hide_index=True)
+            _lowv = low[["name", "총낱개환산", "safety_ea"]].rename(columns={
+                "name": "제품명", "총낱개환산": "현재고(낱개환산)", "safety_ea": "안전재고(낱개환산)"})
+            _lowv["부족분"] = _lowv["안전재고(낱개환산)"] - _lowv["현재고(낱개환산)"]
+            st.dataframe(_lowv, use_container_width=True, hide_index=True)
 
     # 오늘 요일에 납품 나가는 매장 (다중 요일 "화,금" 형식 지원)
     today_day = KOR_WEEKDAY[today_kst().weekday()]
@@ -557,10 +563,12 @@ if page == "📊 대시보드":
         with tab_now:
             view = prods.copy()
             view["총낱개환산"] = view.apply(total_ea, axis=1)
+            view["박스환산"] = view.apply(
+                lambda r: fmt_stock_ea(int(r["총낱개환산"]), r["box_qty"]), axis=1)
             view = view[["name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                         "storage", "delivery_ea", "stock_box", "stock_ea", "총낱개환산", "safety_ea"]]
+                         "storage", "delivery_ea", "총낱개환산", "박스환산", "safety_ea"]]
             view.columns = ["제품명", "바코드", "구분", "박스입수량", "규격(무게)", "정상가", "할인판매가",
-                            "보관방법", "납품갯수(낱개)", "재고(박스)", "재고(낱개)", "총낱개환산", "안전재고(낱개환산)"]
+                            "보관방법", "납품갯수(낱개)", "총낱개환산", "박스환산(자동)", "안전재고(낱개환산)"]
 
             def _row_style(row):
                 s = int(row["안전재고(낱개환산)"] or 0)
@@ -662,18 +670,16 @@ elif page == "📝 일일 기록":
                              ex=exp_date.strftime("%Y-%m-%d") if exp_use else "",
                              m=memo, c=KST_NOW()))]
                     if ttype in ("입고", "출고"):
-                        sign = 1 if ttype == "입고" else -1
-                        new_box = int(prow["stock_box"]) + sign * int(qty_box)
-                        new_ea = int(prow["stock_ea"]) + sign * int(qty_ea)
-                        while new_ea < 0 and new_box > 0:
-                            new_box -= 1
-                            new_ea += box_qty
-                        ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
-                                    dict(b=new_box, e=new_ea, u=KST_NOW(), i=pid)))
-                        ops.append(log_op(pname, "stock_box" if qty_box else "stock_ea",
-                                          f"박스 {prow['stock_box']} / 낱개 {prow['stock_ea']}",
-                                          f"박스 {new_box} / 낱개 {new_ea} ({ttype} {qty_box}박스 {qty_ea}낱개 = 환산 {conv}낱개)"))
-                    run_batch(ops)  # 한 번의 트랜잭션으로 저장
+                        run_batch(ops)  # 거래 이력 저장
+                        ex_str = exp_date.strftime("%Y-%m-%d") if exp_use else ""
+                        if ttype == "입고":
+                            lot_add(pid, ex_str, int(conv), tdate.strftime("%Y-%m-%d"))
+                        else:
+                            lot_consume(pid, int(conv), ex_str)
+                        add_log(pname, "재고(로트)", "", f"{ttype} 환산 {conv}낱개"
+                                + (f" · 기한 {ex_str}" if ex_str else " · 기한없음(FEFO)"))
+                    else:
+                        run_batch(ops)
                     clear_cache()
                     # 수량 입력칸 초기화
                     for k in ("in_box", "in_ea"):
@@ -751,34 +757,30 @@ elif page == "📝 일일 기록":
                     else:
                         prow_map = {r["name"]: r for _, r in prods.iterrows()}
                         ops = []
-                        stock_delta = {}  # pid → 환산낱개 변화 합 (입고+, 출고-)
+                        lot_ops = []  # (pid, expiry, qty_signed)
                         for _, r in valid.iterrows():
                             pr = prow_map[r["제품명"]]
                             pid = int(pr["id"])
                             sid, region = parse_store_choice(str(r["매장"]), stores)
                             ex = "" if pd.isna(r["소비기한"]) else pd.Timestamp(r["소비기한"]).strftime("%Y-%m-%d")
+                            bq = bq_of(pr["box_qty"])
+                            conv = int(r["박스"]) * bq + int(r["낱개"])
                             ops.append((
                                 "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, region, expiry_date, memo, created_at) "
                                 "VALUES (:d, :p, :t, :s, :qb, :qe, :rg, :ex, :m, :c)",
                                 dict(d=bdate.strftime("%Y-%m-%d"), p=pid, t=r["구분"],
                                      s=sid, rg=region,
                                      qb=int(r["박스"]), qe=int(r["낱개"]), ex=ex, m=r["메모"], c=KST_NOW())))
-                            if r["구분"] in ("입고", "출고"):
-                                sign = 1 if r["구분"] == "입고" else -1
-                                bq = max(int(pr["box_qty"]), 1)
-                                stock_delta[pid] = stock_delta.get(pid, 0) + sign * (int(r["박스"]) * bq + int(r["낱개"]))
-                        # 제품별 재고 일괄 반영 (환산낱개 → 박스/낱개 재배분)
-                        for pid, delta in stock_delta.items():
-                            pr = next(p for p in prow_map.values() if int(p["id"]) == pid)
-                            bq = max(int(pr["box_qty"]), 1)
-                            total = int(pr["stock_box"]) * bq + int(pr["stock_ea"]) + delta
-                            new_box, new_ea = (total // bq, total % bq) if total >= 0 else (0, total)
-                            ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
-                                        dict(b=new_box, e=new_ea, u=KST_NOW(), i=pid)))
-                            ops.append(log_op(pr["name"], "stock_box",
-                                              f"박스 {pr['stock_box']} / 낱개 {pr['stock_ea']}",
-                                              f"박스 {new_box} / 낱개 {new_ea} (일괄기록 환산 {'+' if delta>=0 else ''}{delta}낱개)"))
+                            if r["구분"] == "입고":
+                                lot_ops.append((pid, ex, conv))
+                            elif r["구분"] == "출고":
+                                lot_ops.append((pid, ex, -conv))
                         run_batch(ops)
+                        for _pid, _ex, _q in lot_ops:
+                            if _q > 0:
+                                lot_add(_pid, _ex, _q, bdate.strftime("%Y-%m-%d"))
+                            elif _q < 0:
+                                lot_consume(_pid, -_q, _ex)
                         clear_cache("daily_bulk_editor")
                         st.success(f"✅ {bdate.strftime('%Y-%m-%d')} · {len(valid)}건 일괄 저장 완료")
                         st.rerun()
@@ -884,21 +886,16 @@ elif page == "📝 일일 기록":
                 f"#{i} | " + " | ".join(map(str, tx[tx['id'] == i][['날짜','제품명','구분','매장','박스','낱개']].iloc[0].tolist())),
             )
             if del_id and st.button("🗑️ 선택 기록 삭제"):
-                row = qdf("SELECT product_id, ttype, qty_box, qty_ea FROM transactions WHERE id=:i", i=del_id)
+                row = qdf("SELECT product_id, ttype, qty_box, qty_ea, expiry_date FROM transactions WHERE id=:i", i=del_id)
                 if not row.empty:
                     r = row.iloc[0]
-                    ops = []
-                    if r["ttype"] in ("입고", "출고"):
-                        sign = -1 if r["ttype"] == "입고" else 1
-                        pr2 = prods[prods["id"] == int(r["product_id"])].iloc[0]
-                        nb2, ne2 = normalize_stock(
-                            int(pr2["stock_box"]) + sign * int(r["qty_box"]),
-                            int(pr2["stock_ea"]) + sign * int(r["qty_ea"]),
-                            int(pr2["box_qty"]))
-                        ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
-                                    dict(b=nb2, e=ne2, u=KST_NOW(), i=int(r["product_id"]))))
-                    ops.append(("DELETE FROM transactions WHERE id=:i", {"i": del_id}))
-                    run_batch(ops)
+                    pr2 = prods[prods["id"] == int(r["product_id"])].iloc[0]
+                    conv = int(r["qty_box"]) * bq_of(pr2["box_qty"]) + int(r["qty_ea"])
+                    run("DELETE FROM transactions WHERE id=:i", i=int(del_id))
+                    if r["ttype"] == "입고":       # 입고 취소 → 로트 차감
+                        lot_consume(int(r["product_id"]), conv, str(r["expiry_date"] or ""))
+                    elif r["ttype"] == "출고":     # 출고 취소 → 로트 복원
+                        lot_add(int(r["product_id"]), str(r["expiry_date"] or ""), conv)
                     clear_cache()
                     st.success("삭제 및 재고 복원 완료")
                     st.rerun()
@@ -1004,15 +1001,21 @@ elif page == "📦 제품 관리(엑셀표)":
         prods_view = prods_view[m]
 
     grid_cols = ["id", "name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                 "storage", "delivery_ea", "stock_box", "stock_ea", "safety_ea", "memo", "updated_at"]
+                 "storage", "delivery_ea", "safety_ea", "memo", "updated_at"]
     grid = prods_view[grid_cols].copy() if not prods_view.empty else pd.DataFrame(columns=grid_cols)
+    # 현재고(낱개환산)는 로트 합계 → 읽기전용 표시
+    _sk = stock_of()
+    if not grid.empty:
+        grid.insert(grid.columns.get_loc("safety_ea"), "현재고", grid["id"].apply(lambda i: int(_sk.get(int(i), 0))))
+    else:
+        grid["현재고"] = pd.Series(dtype="int")
 
     edited = st.data_editor(
         grid,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        disabled=["id", "updated_at", "박스환산"],
+        disabled=["id", "updated_at", "현재고"],
         column_config={
             "id": st.column_config.NumberColumn("ID", width="small"),
             "name": st.column_config.TextColumn("제품명", required=True),
@@ -1027,13 +1030,11 @@ elif page == "📦 제품 관리(엑셀표)":
             "storage": st.column_config.SelectboxColumn("보관방법", options=STORAGE_OPTIONS,
                                                         help="상온/냉장/냉동"),
             "delivery_ea": st.column_config.NumberColumn("납품갯수(낱개)", min_value=0, step=1),
-            "stock_box": st.column_config.NumberColumn("재고(박스)", step=1),
-            "stock_ea": st.column_config.NumberColumn(
-                "재고(낱개)", step=1,
-                help="박스입수량 이상 입력하면 저장 시 박스로 자동 변환됩니다"),
+            "현재고": st.column_config.NumberColumn("현재고(낱개환산)",
+                help="로트 합계로 자동 계산됩니다. 재고 조정은 일일 기록(입고/출고) 또는 '🧺 로트 직접 편집'에서 하세요."),
             "safety_ea": st.column_config.NumberColumn(
                 "안전재고(낱개환산)", min_value=0, step=1,
-                help="제품별 안전재고. 총재고(낱개환산)가 이 값 이상이면 대시보드에서 초록 배경으로 표시"),
+                help="제품별 안전재고. 현재고가 이 값 이상이면 대시보드에서 초록 배경으로 표시"),
             "memo": st.column_config.TextColumn("메모"),
             "updated_at": st.column_config.TextColumn("저장시각(자동)", help="이 행이 마지막으로 저장된 일시"),
         },
@@ -1062,14 +1063,9 @@ elif page == "📦 제품 관리(엑셀표)":
                 "sale_price": int(r["sale_price"]) if pd.notna(r["sale_price"]) else 0,
                 "storage": r["storage"] if r["storage"] in STORAGE_OPTIONS else "상온",
                 "delivery_ea": int(r["delivery_ea"]) if pd.notna(r["delivery_ea"]) else 0,
-                "stock_box": int(r["stock_box"]) if pd.notna(r["stock_box"]) else 0,
-                "stock_ea": int(r["stock_ea"]) if pd.notna(r["stock_ea"]) else 0,
                 "safety_ea": int(r["safety_ea"]) if pd.notna(r["safety_ea"]) else 0,
                 "memo": "" if pd.isna(r["memo"]) else str(r["memo"]),
             }
-            # 낱개 → 박스 자동 변환 (예: 입수량 12, 낱개 30 → 박스 +2, 낱개 6)
-            vals["stock_box"], vals["stock_ea"] = normalize_stock(
-                vals["stock_box"], vals["stock_ea"], vals["box_qty"])
             if pd.notna(rid) and int(rid) in old_map:  # 기존 행 수정
                 rid = int(rid); seen_ids.add(rid)
                 old = old_map[rid]
@@ -1114,62 +1110,55 @@ elif page == "📦 제품 관리(엑셀표)":
         st.success(f"✅ 저장 완료 — 변경 {changes}건이 변경이력에 기록되었습니다.")
         st.rerun()
 
-    # ── 수동입력분 정리 도구 ──
+    # ── 🧺 로트 직접 편집 (재고 = 로트 합계이므로 여기서 소비기한·수량을 바로 고침) ──
     st.divider()
-    with st.expander("🧹 수동입력분 정리 — 소비기한 수량 맞추기", expanded=False):
-        md = manual_diffs()
-        targets = md[md["수동조정분"] != 0] if not md.empty else pd.DataFrame()
-        if targets.empty:
-            st.success("✅ 모든 제품의 재고가 입출고 기록과 일치합니다. 정리할 수동입력분이 없습니다.")
+    with st.expander("🧺 로트(소비기한별 재고) 직접 편집", expanded=False):
+        st.caption("재고는 이 로트들의 합계입니다. 소비기한·수량을 직접 고치거나, 행을 추가/삭제하면 재고에 바로 반영됩니다.")
+        lots_all = df_lots()
+        lot_prod = st.selectbox("제품 선택", ["(전체)"] + prods["name"].tolist(), key="lot_edit_prod")
+        lv = lots_all if lot_prod == "(전체)" else lots_all[lots_all["제품명"] == lot_prod]
+        if lv.empty:
+            st.info("표시할 로트가 없습니다. 일일 기록에서 입고를 추가하면 로트가 생성됩니다.")
         else:
-            st.caption("현재고와 입출고 기록이 어긋난 제품 목록입니다. 제품을 골라 처리 방법을 선택하세요.")
-            st.dataframe(targets[["제품명", "현재고", "기록잔여", "수동조정분"]],
-                         use_container_width=True, hide_index=True)
-
-            fix_name = st.selectbox("정리할 제품", targets["제품명"].tolist(), key="fix_prod")
-            row = targets[targets["제품명"] == fix_name].iloc[0]
-            fpid, fbq = int(row["pid"]), int(row["box_qty"])
-            fdiff = int(row["수동조정분"])
-            st.info(f"**{fix_name}** — 현재고 {row['현재고']:,}낱개 / 기록잔여 {row['기록잔여']:,}낱개 / "
-                    f"수동조정분 **{fdiff:+,}낱개**")
-
-            method = st.radio("처리 방법", [
-                "🗑️ 수동분 삭제 — 재고를 기록 기준으로 되돌림 (소비기한 표와 즉시 일치)",
-                "📝 기록으로 전환 — 재고는 유지하고 입고/출고 기록을 생성 (소비기한 지정 가능)",
-            ], key="fix_method")
-
-            exp_use2 = exp_date2 = None
-            if method.startswith("📝") and fdiff > 0:
-                exp_use2 = st.checkbox("전환되는 입고분에 소비기한 입력", key="fix_exp_use")
-                exp_date2 = st.date_input("소비기한", value=today_kst(), key="fix_exp_date",
-                                          label_visibility="collapsed")
-
-            if st.button("⚡ 정리 실행", type="primary", use_container_width=True, key="fix_run"):
-                ops = []
-                if method.startswith("🗑️"):
-                    rec = int(row["기록잔여"])
-                    nb, ne = rec // fbq, rec % fbq
-                    ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
-                                dict(b=nb, e=ne, u=KST_NOW(), i=fpid)))
-                    ops.append(log_op(fix_name, "stock_box",
-                                      f"수동조정분 {fdiff:+,}낱개 포함 {row['현재고']:,}낱개",
-                                      f"기록 기준 {rec:,}낱개(박스 {nb}/낱개 {ne})로 정리 [수동분 삭제]"))
+            grid = lv[["id", "제품명", "소비기한", "입고일", "잔여낱개"]].copy()
+            grid["소비기한"] = pd.to_datetime(grid["소비기한"].replace("", pd.NA), errors="coerce")
+            grid["입고일"] = pd.to_datetime(grid["입고일"].replace("", pd.NA), errors="coerce")
+            ed = st.data_editor(
+                grid, hide_index=True, use_container_width=True, num_rows="fixed",
+                disabled=["id", "제품명"],
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", width="small"),
+                    "소비기한": st.column_config.DateColumn("소비기한", format="YYYY-MM-DD"),
+                    "입고일": st.column_config.DateColumn("입고일", format="YYYY-MM-DD"),
+                    "잔여낱개": st.column_config.NumberColumn("잔여(낱개환산)", min_value=0, step=1),
+                }, key="lot_editor")
+            if st.button("💾 로트 저장", type="primary", key="lot_save"):
+                def _d(v):
+                    return "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d")
+                omap = {int(r["id"]): r for _, r in lv.iterrows()}
+                ops, n = [], 0
+                for _, r in ed.iterrows():
+                    rid = int(r["id"]); o = omap.get(rid)
+                    if o is None:
+                        continue
+                    ne, ie, qq = _d(r["소비기한"]), _d(r["입고일"]), int(r["잔여낱개"] or 0)
+                    if (str(o["소비기한"] or ""), str(o["입고일"] or ""), int(o["잔여낱개"])) != (ne, ie, qq):
+                        if qq <= 0:
+                            ops.append(("DELETE FROM lots WHERE id=:i", {"i": rid}))
+                        else:
+                            ops.append(("UPDATE lots SET expiry_date=:e, in_date=:d, qty_ea=:q, updated_at=:u WHERE id=:i",
+                                        dict(e=ne, d=ie, q=qq, u=KST_NOW(), i=rid)))
+                        add_log(str(o["제품명"]), "로트수정",
+                                f"기한 {o['소비기한'] or '없음'} / {int(o['잔여낱개'])}낱개",
+                                f"기한 {ne or '없음'} / {qq}낱개")
+                        n += 1
+                if n == 0:
+                    st.info("변경된 내용이 없습니다.")
                 else:
-                    ttype2 = "입고" if fdiff > 0 else "출고"
-                    qty = abs(fdiff)
-                    ex2 = exp_date2.strftime("%Y-%m-%d") if (exp_use2 and exp_date2) else ""
-                    ops.append((
-                        "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, expiry_date, memo, created_at) "
-                        "VALUES (:d, :p, :t, NULL, 0, :qe, :ex, :m, :c)",
-                        dict(d=TODAY(), p=fpid, t=ttype2, qe=qty, ex=ex2,
-                             m="[수동분 기록전환] 재고-기록 차이 정리", c=KST_NOW())))
-                    ops.append(log_op(fix_name, "stock_box",
-                                      f"수동조정분 {fdiff:+,}낱개",
-                                      f"{ttype2} {qty:,}낱개 기록으로 전환 (재고 변동 없음)"))
-                run_batch(ops)
-                clear_cache("prod_editor")
-                st.success(f"✅ '{fix_name}' 정리 완료 — 소비기한별 잔여 수량이 이제 일치합니다.")
-                st.rerun()
+                    run_batch(ops)
+                    clear_cache("lot_editor")
+                    st.success(f"✅ 로트 {n}건 반영 완료 — 재고에 즉시 반영됩니다.")
+                    st.rerun()
 
     # ── 제품 상세: 이미지 / 구성품 / 납품처 ──
     st.divider()

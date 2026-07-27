@@ -115,6 +115,15 @@ CREATE TABLE IF NOT EXISTS daily_notes (
     content TEXT DEFAULT '',
     updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS lots (
+    id SERIAL PRIMARY KEY,
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    expiry_date TEXT DEFAULT '',
+    in_date TEXT DEFAULT '',
+    qty_ea INTEGER DEFAULT 0,
+    updated_at TEXT DEFAULT '',
+    UNIQUE(product_id, expiry_date)
+);
 CREATE TABLE IF NOT EXISTS stock_snapshots (
     id SERIAL PRIMARY KEY,
     sdate TEXT NOT NULL,
@@ -151,8 +160,8 @@ CREATE TABLE IF NOT EXISTS change_logs (
 """
 
 
-SCHEMA_VERSION = 14
-LOGIC_VERSION = "v14-FEFO"  # 계산 로직 버전 (배포된 core.py 확인용 · 화면 표시)  # ⚠️ 테이블/컬럼을 추가할 때마다 +1 하세요. 배포 시 자동으로 스키마가 갱신됩니다.
+SCHEMA_VERSION = 15
+LOGIC_VERSION = "v15-LOTS"  # 계산 로직 버전 (배포된 core.py 확인용 · 화면 표시)  # ⚠️ 테이블/컬럼을 추가할 때마다 +1 하세요. 배포 시 자동으로 스키마가 갱신됩니다.
 
 
 @st.cache_resource
@@ -280,9 +289,11 @@ def qdf(sql: str, **params) -> pd.DataFrame:
 
 SNAPSHOT_SQL = """
 INSERT INTO stock_snapshots (sdate, product_id, stock_box, stock_ea, total_ea)
-SELECT :d, id, stock_box, stock_ea, stock_box * GREATEST(box_qty, 1) + stock_ea FROM products
+SELECT :d, p.id, 0, 0, COALESCE(SUM(l.qty_ea), 0)
+FROM products p LEFT JOIN lots l ON l.product_id = p.id AND l.qty_ea > 0
+GROUP BY p.id
 ON CONFLICT (sdate, product_id)
-DO UPDATE SET stock_box = EXCLUDED.stock_box, stock_ea = EXCLUDED.stock_ea, total_ea = EXCLUDED.total_ea
+DO UPDATE SET total_ea = EXCLUDED.total_ea
 """
 
 
@@ -294,7 +305,12 @@ def snapshot_today():
         pass  # 스냅샷 실패가 앱 사용을 막지 않도록
 
 
+_STOCK_CACHE = {}
+
+
 def clear_cache(*editor_keys):
+    global _STOCK_CACHE
+    _STOCK_CACHE = {}
     """저장 후: 오늘 재고 스냅샷 갱신 + 조회 캐시 초기화 + 표 편집기 상태 초기화.
     ※ st.data_editor는 key별로 수정 내역(delta)을 세션에 보관했다가 재실행 때 다시 덧씌운다.
        저장 후 이를 지우지 않으면 DB에는 반영돼도 화면이 옛 값으로 되돌아간 것처럼 보인다."""
@@ -374,115 +390,89 @@ def manual_diffs() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+# ──────────────────────────────────────────────
+# 로트 엔진 (lots = 재고의 유일한 진실)
+# ──────────────────────────────────────────────
+def lot_add(pid: int, expiry: str, qty_ea: int, in_date: str = ""):
+    """입고: 제품+소비기한 로트에 수량 합산 (없으면 생성)."""
+    run("""INSERT INTO lots (product_id, expiry_date, in_date, qty_ea, updated_at)
+           VALUES (:p, :e, :d, :q, :u)
+           ON CONFLICT (product_id, expiry_date)
+           DO UPDATE SET qty_ea = lots.qty_ea + :q, in_date = :d, updated_at = :u""",
+        p=pid, e=expiry or "", d=in_date or TODAY(), q=int(qty_ea), u=KST_NOW())
+
+
+def lot_consume(pid: int, qty_ea: int, expiry: str = ""):
+    """출고: expiry 지정 시 그 로트에서, 미지정 시 소비기한 짧은 것부터(FEFO) 차감.
+    부족하면 가능한 만큼만 빼고 음수로 만들지 않음(로트는 0 이상 유지)."""
+    need = int(qty_ea)
+    ops = []
+    if expiry:
+        cur = qdf("SELECT id, qty_ea FROM lots WHERE product_id=:p AND expiry_date=:e", p=pid, e=expiry)
+        if not cur.empty:
+            take = min(int(cur.iloc[0]["qty_ea"]), need)
+            ops.append(("UPDATE lots SET qty_ea = qty_ea - :t, updated_at=:u WHERE id=:i",
+                        dict(t=take, u=KST_NOW(), i=int(cur.iloc[0]["id"]))))
+            need -= take
+    if need > 0:  # 미지정이거나 지정 로트 부족분 → FEFO
+        rows = qdf("""SELECT id, qty_ea FROM lots WHERE product_id=:p AND qty_ea > 0
+                      ORDER BY CASE WHEN expiry_date='' THEN '9999-99-99' ELSE expiry_date END, id""", p=pid)
+        for _, r in rows.iterrows():
+            if need <= 0:
+                break
+            take = min(int(r["qty_ea"]), need)
+            ops.append(("UPDATE lots SET qty_ea = qty_ea - :t, updated_at=:u WHERE id=:i",
+                        dict(t=take, u=KST_NOW(), i=int(r["id"]))))
+            need -= take
+    if ops:
+        run_batch(ops)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def df_lots(pid: int = None) -> pd.DataFrame:
+    """로트 원장: 제품·소비기한별 현재 수량 (0 이하 자동 제외)."""
+    q = """SELECT l.id, l.product_id AS pid, p.name AS 제품명, p.box_qty,
+                  l.expiry_date AS 소비기한, l.in_date AS 입고일, l.qty_ea AS 잔여낱개
+           FROM lots l JOIN products p ON p.id = l.product_id WHERE l.qty_ea > 0"""
+    params = {}
+    if pid is not None:
+        q += " AND l.product_id = :p"; params["p"] = pid
+    q += " ORDER BY p.name, CASE WHEN l.expiry_date='' THEN '9999-99-99' ELSE l.expiry_date END"
+    return qdf(q, **params)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def stock_of(pid: int = None) -> dict:
+    """제품별 현재 재고(낱개환산) = 로트 합계. {pid: qty_ea}"""
+    q = "SELECT product_id AS pid, COALESCE(SUM(qty_ea),0) AS q FROM lots WHERE qty_ea > 0"
+    params = {}
+    if pid is not None:
+        q += " AND product_id=:p"; params["p"] = pid
+    q += " GROUP BY product_id"
+    df = qdf(q, **params)
+    return {int(r["pid"]): int(r["q"]) for _, r in df.iterrows()}
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def expiry_breakdown() -> pd.DataFrame:
-    """제품별 · 소비기한별 잔여 낱개 계산 (현재 재고와 합계 일치 보정 포함).
-    1) 입고 로트(소비기한별)에서 총출고량을 기한 빠른 순(FIFO)으로 차감
-    2) 그 결과 합계를 '현재 재고(표에서 수동 수정한 값 포함)'와 비교해 보정:
-       - 실재고가 더 적으면 → 차이를 기한 빠른 로트부터 추가 차감
-       - 실재고가 더 많으면 → '(수동조정분)' 행으로 ± 표시
-    → 잔여 합계가 항상 현재 재고(총낱개환산)와 일치"""
-    prods = df_products()
-    if prods.empty:
+    """소비기한별 잔여 = 로트 그대로. (재고 = 로트 합계이므로 항상 일치)"""
+    lots = df_lots()
+    if lots.empty:
         return pd.DataFrame()
-    lots = qdf("""
-        SELECT p.id AS pid, p.name AS 제품명, p.box_qty,
-               t.expiry_date AS 소비기한,
-               SUM(t.qty_box * GREATEST(p.box_qty,1) + t.qty_ea) AS 입고낱개
-        FROM transactions t JOIN products p ON p.id = t.product_id
-        WHERE t.ttype = '입고'
-        GROUP BY p.id, p.name, p.box_qty, t.expiry_date""")
-    outs = qdf("""
-        SELECT product_id AS pid, t.expiry_date AS 지정기한,
-               SUM(t.qty_box * GREATEST(p.box_qty,1) + t.qty_ea) AS 출고낱개
-        FROM transactions t JOIN products p ON p.id = t.product_id
-        WHERE t.ttype = '출고' GROUP BY product_id, t.expiry_date""")
-    # 기한 지정 출고: {(pid, 기한): 수량} / 미지정 출고: {pid: 수량}
-    out_target, out_plain = {}, {}
-    if not outs.empty:
-        for _, _o in outs.iterrows():
-            _pid, _ex, _q = int(_o["pid"]), str(_o["지정기한"] or ""), int(_o["출고낱개"])
-            if _ex:
-                out_target[(_pid, _ex)] = out_target.get((_pid, _ex), 0) + _q
-            else:
-                out_plain[_pid] = out_plain.get(_pid, 0) + _q
-    cur_map = {int(r["id"]): (r["name"], bq_of(r["box_qty"]), total_ea(r))
-               for _, r in prods.iterrows()}
-
     rows = []
-    lot_pids = set(lots["pid"].tolist()) if not lots.empty else set()
-    for pid, (pname, bq, cur_total) in cur_map.items():
-        # ── 차감 순서 원칙 (유통기한 우선) ──
-        #  출고는 ① 소비기한이 짧은 로트부터(FIFO) 차감 → ② 로트를 다 쓰면 수동재고(M0)에서 차감.
-        #  제품 관리(엑셀표)에서 재고를 줄인 경우(M0<0)도 추가 출고처럼 짧은 로트부터 차감.
-        #  → 일일기록에서 출고로 수량을 맞추면 기한 짧은 로트가 즉시 줄어듦.
-        IN_total = 0
-        g = None
-        if pid in lot_pids:
-            g = lots[lots["pid"] == pid].copy()
-            g["_ord"] = g["소비기한"].apply(lambda v: v if v else "9999-99-99")
-            g = g.sort_values("_ord")
-            IN_total = int(g["입고낱개"].sum())
-        OUT_total = sum(q for (p2, _), q in out_target.items() if p2 == pid) + int(out_plain.get(pid, 0))
-        M0 = int(cur_total) - IN_total + OUT_total   # 기록 밖(수동) 기반 재고량
-
-        # 로트별 수량 사전 구성 (기한 오름차순)
-        lot_list = []   # [기한(빈값=''), 수량]
-        if g is not None:
-            for _, r in g.iterrows():
-                lot_list.append([str(r["소비기한"] or ""), int(r["입고낱개"])])
-        # ①단계: 소비기한을 지정한 출고 → 같은 기한 로트에서 직접 차감 (초과분은 FEFO 풀로)
-        spill_to_fefo = 0
-        for i, (ex, q) in enumerate(lot_list):
-            t_out = out_target.get((pid, ex), 0)
-            take = min(q, t_out)
-            lot_list[i][1] = q - take
-            spill_to_fefo += t_out - take
-        # 지정기한이 로트에 없는 출고(오타 등)도 FEFO 풀로
-        matched = {ex for ex, _ in lot_list}
-        for (p2, ex), q in out_target.items():
-            if p2 == pid and ex not in matched:
-                spill_to_fefo += q
-        # ②단계: 미지정 출고 + 지정 초과분 + 수동 감소분 → 짧은 기한부터(FEFO)
-        extra_out = -M0 if M0 < 0 else 0
-        fefo_out = int(out_plain.get(pid, 0)) + spill_to_fefo + extra_out
-        remain = fefo_out
-        for i, (ex, q) in enumerate(lot_list):
-            take = min(q, remain)
-            remain -= take
-            lot_list[i][1] = q - take
-        # ③단계: 로트로 못 막은 출고는 수동재고에서
-        manual_left = max(M0, 0) - remain
-        if manual_left < 0:
-            manual_left = 0
-
-        leftovers = []
-        for ex, q in lot_list:
-            if q > 0:
-                ordkey = ex if ex else "9999-99-99"
-                leftovers.append([ordkey, ex or "(기한없음)", q])
-        if manual_left > 0:
-            leftovers.append(["9999-99-98", "(수동조정분)", manual_left])
-        # 안전망: 어떤 경우에도 합계 = 현재고
-        residual = int(cur_total) - sum(x[2] for x in leftovers)
-        if residual != 0:
-            leftovers.append(["9999-99-97", "(수동조정분)", residual])
-
-        for _ord, exp, left in leftovers:
+    for _, r in lots.iterrows():
+        bq = bq_of(r["box_qty"])
+        left = int(r["잔여낱개"])
+        exp = r["소비기한"] or "(기한없음)"
+        dday = ""
+        try:
+            dd = (pd.Timestamp(str(exp)).date() - today_kst()).days
+            dday = f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY")
+        except Exception:
             dday = ""
-            try:
-                dd = (pd.Timestamp(str(exp)).date() - today_kst()).days
-                dday = f"D{dd:+d}" if dd < 0 else (f"D-{dd}" if dd > 0 else "D-DAY")
-            except Exception:
-                dday = ""  # 날짜가 아닌 항목((기한없음)/(기한미상)) 은 공란
-            if left >= 0:
-                bx = f"{left // bq}박스 {left % bq}낱개"
-            else:
-                bx = f"-{(-left) // bq}박스 {(-left) % bq}낱개"
-            rows.append(dict(제품명=pname, 소비기한=exp,
-                             잔여낱개환산=left,
-                             박스환산=bx,
-                             디데이=dday))
+        rows.append(dict(제품명=r["제품명"], 소비기한=exp, 잔여낱개환산=left,
+                         박스환산=f"{left // bq}박스 {left % bq}낱개", 디데이=dday))
     return pd.DataFrame(rows)
 
 
@@ -739,6 +729,15 @@ def bq_of(v) -> int:
     return max(n, 1)
 
 
+def fmt_stock_ea(total_ea: int, box_qty) -> str:
+    """낱개환산 합계를 '박스/낱개'로 표시."""
+    bq = bq_of(box_qty)
+    t = int(total_ea)
+    if t < 0:
+        return f"-{(-t)//bq}박스 {(-t)%bq}낱개"
+    return f"{t//bq}박스 {t%bq}낱개"
+
+
 def fmt_stock(box, ea, box_qty) -> str:
     """재고를 박스 단위로 자동 정규화해 표시 (보기 전용, 저장값은 그대로).
     예: 박스입수량 12, 재고 낱개 75 → '6박스 3낱개'"""
@@ -758,7 +757,14 @@ def safety_mark(total: int, safety) -> str:
 
 
 def total_ea(row) -> int:
-    return int(row["stock_box"] or 0) * bq_of(row["box_qty"]) + int(row["stock_ea"] or 0)
+    """제품 현재고(낱개환산) = 로트 합계. row는 제품 행(id 필요)."""
+    global _STOCK_CACHE
+    pid = int(row["id"]) if "id" in row and pd.notna(row["id"]) else None
+    if pid is None:
+        return 0
+    if not _STOCK_CACHE:
+        _STOCK_CACHE = stock_of()
+    return int(_STOCK_CACHE.get(pid, 0))
 
 
 def normalize_stock(box: int, ea: int, box_qty: int):
@@ -987,3 +993,39 @@ def build_calendar_html(year: int, month: int, events: dict) -> str:
         body += "</tr>"
     return (f"<table style='width:100%; border-collapse:collapse; table-layout:fixed;'>"
             f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+
+
+def migrate_to_lots_once():
+    """기존 데이터 → lots 이관 (최초 1회). 입고 기록의 소비기한별 로트 생성 후,
+    총출고를 FEFO로 차감하고, 남는 현재고 차이는 (기한없음) 로트로 보정."""
+    done = qdf("SELECT value FROM app_settings WHERE key='lots_migrated'")
+    if not done.empty and done.iloc[0]["value"] == "1":
+        return
+    prods = qdf("SELECT id, box_qty, stock_box, stock_ea FROM products")
+    if not prods.empty:
+        for _, p in prods.iterrows():
+            pid = int(p["id"]); bq = bq_of(p["box_qty"])
+            ins = qdf("""SELECT expiry_date AS e, MIN(tdate) AS d,
+                                SUM(qty_box*:bq + qty_ea) AS q
+                         FROM transactions WHERE product_id=:p AND ttype='입고'
+                         GROUP BY expiry_date""", bq=bq, p=pid)
+            for _, r in ins.iterrows():
+                if int(r["q"]) > 0:
+                    lot_add(pid, str(r["e"] or ""), int(r["q"]), str(r["d"] or TODAY()))
+            outs = qdf("""SELECT expiry_date AS e, SUM(qty_box*:bq + qty_ea) AS q
+                          FROM transactions WHERE product_id=:p AND ttype='출고'
+                          GROUP BY expiry_date""", bq=bq, p=pid)
+            for _, r in outs.iterrows():
+                if int(r["q"]) > 0:
+                    lot_consume(pid, int(r["q"]), str(r["e"] or ""))
+            # 현재고(제품 표)와 로트 합계 차이 보정
+            cur = int(p["stock_box"]) * bq + int(p["stock_ea"])
+            _got = qdf("SELECT COALESCE(SUM(qty_ea),0) AS q FROM lots WHERE product_id=:p AND qty_ea>0", p=pid)
+            got = int(_got.iloc[0]["q"]) if not _got.empty else 0
+            diff = cur - got
+            if diff > 0:
+                lot_add(pid, "", diff, TODAY())
+            elif diff < 0:
+                lot_consume(pid, -diff, "")
+    set_setting("lots_migrated", "1")
+    clear_cache()
