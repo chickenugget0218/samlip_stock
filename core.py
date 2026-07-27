@@ -22,7 +22,7 @@ def today_kst() -> date:
 
 STORAGE_OPTIONS = ["상온", "냉장", "냉동"]
 NEW_OLD_OPTIONS = ["신규", "기존"]
-TTYPE_OPTIONS = ["입고", "출고", "발주"]
+TTYPE_OPTIONS = ["입고", "출고", "반품", "발주"]  # 반품=매장에서 되돌아온 재고(다시 +)
 DAY_OPTIONS = ["월", "화", "수", "목", "금", "토", "일", "매일"]
 DAY_COLORS = ["#FF6B6B", "#FFD93D", "#6BCB77", "#B983FF", "#4D96FF", "#00C2CB", "#FF9F45", "#9E9E9E"]  # 월~일·매일
 DAY_COLOR_MAP = dict(zip(DAY_OPTIONS, DAY_COLORS))

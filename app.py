@@ -150,7 +150,7 @@ def open_day_dialog(dsel: str):
         old_map = {int(r["id"]): r for _, r in day_tx.iterrows()} if not day_tx.empty else {}
 
         def _eff(tt, qb, qe, bq):
-            if tt == "입고":
+            if tt in ("입고", "반품"):      # 반품 = 매장에서 되돌아온 재고 → 다시 +
                 return qb * bq + qe
             if tt == "출고":
                 return -(qb * bq + qe)
@@ -160,6 +160,18 @@ def open_day_dialog(dsel: str):
             return "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d")
 
         ops, deltas, seen, n_chg = [], {}, set(), 0
+        lot_ops = []  # (pid, expiry, qty_signed)  qty_signed>0 → lot_add, <0 → lot_consume
+
+        def _revert(o):
+            e = _eff(o["구분"], int(o["박스"]), int(o["낱개"]),
+                     bq_of(prow_map.get(str(o["제품명"]), {"box_qty": 1}).get("box_qty", 1)))
+            # 입고였으면(+) 되돌림은 로트 차감(-), 출고였으면(-) 되돌림은 로트 추가(+)
+            lot_ops.append((int(o["product_id"]), str(o["소비기한"] or ""), -e))
+
+        def _apply(pid, tt, qb, qe, bq, ex):
+            e = _eff(tt, qb, qe, bq)
+            lot_ops.append((pid, ex, e))
+
         for _, r in edited.iterrows():
             if pd.isna(r["제품명"]) or str(r["제품명"]) not in prow_map:
                 continue
@@ -206,21 +218,6 @@ def open_day_dialog(dsel: str):
                 ops.append(("DELETE FROM transactions WHERE id=:i", {"i": rid}))
                 ops.append(log_op(str(o["제품명"]), "기록삭제", f"#{rid} {o['구분']} {o['박스']}박스 {o['낱개']}낱개", "(달력에서 삭제)"))
                 n_chg += 1
-
-        # 로트 연산 수집: 기존 행은 (되돌림 + 새 반영), 신규는 반영, 삭제는 되돌림
-        # _eff 부호: 입고+ / 출고- . 로트에는 '입고 취소=consume, 출고 취소=add' 로 반영.
-        lot_ops = []  # (pid, expiry, qty_signed)  qty_signed>0 → lot_add, <0 → lot_consume
-
-        def _revert(o):
-            e = _eff(o["구분"], int(o["박스"]), int(o["낱개"]),
-                     bq_of(prow_map.get(str(o["제품명"]), {"box_qty": 1}).get("box_qty", 1)))
-            # 입고였으면(+) 되돌림은 로트 차감(-), 출고였으면(-) 되돌림은 로트 추가(+)
-            lot_ops.append((int(o["product_id"]), str(o["소비기한"] or ""), -e))
-
-        def _apply(pid, tt, qb, qe, bq, ex):
-            e = _eff(tt, qb, qe, bq)
-            lot_ops.append((pid, ex, e))
-
 
         if n_chg == 0:
             st.info("변경된 내용이 없습니다.")
@@ -331,20 +328,38 @@ if st.session_state.get("_open_day"):
     _d = st.session_state.pop("_open_day")
     open_day_dialog(_d)
 
-st.sidebar.title("📦 삼립 무인편의점 재고관리")
-_CORE_PAGES = ["📊 대시보드", "📅 교체·발주 일정", "📝 일일 기록", "📦 제품 관리(엑셀표)", "🏬 납품처 관리(엑셀표)", "📋 납품 정리표(매장×제품)"]
-_EXTRA_PAGES = ["📈 일자별 누적(수불부)", "🗒️ 일자별 메모", "📜 변경이력", "⬇️ 엑셀 내보내기"]
+st.sidebar.title("📦 삼립 무인편의점")
+
+# ── 4개 핵심 화면 + 설정(기타) ──
+#  ① 오늘 할 일  ② 입출고(로트 자동반영)  ③ 재고 현황  ④ 메모
+_MAIN = {
+    "🏠 오늘 할 일 (달력·발주)": "📊 대시보드",
+    "🔄 입출고 (입고·출고·반품·교체)": "📝 일일 기록",
+    "📦 재고 현황 (제품·소비기한)": "📦 재고 현황",
+    "🗒️ 메모": "🗒️ 일자별 메모",
+}
+_SETTINGS = {
+    "📅 교체·발주 일정 (상세)": "📅 교체·발주 일정",
+    "🗂️ 제품 관리": "📦 제품 관리(엑셀표)",
+    "🏬 납품처 관리": "🏬 납품처 관리(엑셀표)",
+    "📋 납품 정리표": "📋 납품 정리표(매장×제품)",
+    "📜 변경이력": "📜 변경이력",
+    "⬇️ 엑셀 내보내기": "⬇️ 엑셀 내보내기",
+}
 
 
-def _reset_extra():
-    st.session_state["nav_extra"] = "(선택 안 함)"
+def _reset_settings():
+    st.session_state["nav_settings"] = "(선택 안 함)"
 
 
-sel_main = st.sidebar.radio("메뉴", _CORE_PAGES, key="nav_main", on_change=_reset_extra)
-with st.sidebar.expander("📁 기타 (수불부·메모·이력·엑셀)"):
-    sel_extra = st.radio("기타 메뉴", ["(선택 안 함)"] + _EXTRA_PAGES, key="nav_extra",
-                         label_visibility="collapsed")
-page = sel_extra if sel_extra != "(선택 안 함)" else sel_main
+_main_label = st.sidebar.radio("메뉴", list(_MAIN.keys()), key="nav_main", on_change=_reset_settings)
+with st.sidebar.expander("⚙️ 설정·관리 (제품·납품처·이력 등)"):
+    _set_label = st.radio("설정 메뉴", ["(선택 안 함)"] + list(_SETTINGS.keys()),
+                          key="nav_settings", label_visibility="collapsed")
+page = _SETTINGS[_set_label] if _set_label != "(선택 안 함)" else _MAIN[_main_label]
+
+st.sidebar.divider()
+st.sidebar.caption("① 오늘 할 일 → 달력에서 교체·발주 확인\n\n② 입출고 → 입고·출고·반품(제품 교체) 기록·수정\n\n③ 재고 현황 → 지금 남은 재고·소비기한\n\n④ 메모 → 일자별 업무 메모")
 
 
 # ══════════════════════════════════════════════
@@ -685,10 +700,10 @@ elif page == "📝 일일 기록":
                              qb=int(qty_box), qe=int(qty_ea),
                              ex=exp_date.strftime("%Y-%m-%d") if exp_use else "",
                              m=memo, c=KST_NOW()))]
-                    if ttype in ("입고", "출고"):
+                    if ttype in ("입고", "출고", "반품"):
                         run_batch(ops)  # 거래 이력 저장
                         ex_str = exp_date.strftime("%Y-%m-%d") if exp_use else ""
-                        if ttype == "입고":
+                        if ttype in ("입고", "반품"):   # 반품도 재고 +
                             lot_add(pid, ex_str, int(conv), tdate.strftime("%Y-%m-%d"))
                         else:
                             lot_consume(pid, int(conv), ex_str)
@@ -787,7 +802,7 @@ elif page == "📝 일일 기록":
                                 dict(d=bdate.strftime("%Y-%m-%d"), p=pid, t=r["구분"],
                                      s=sid, rg=region,
                                      qb=int(r["박스"]), qe=int(r["낱개"]), ex=ex, m=r["메모"], c=KST_NOW())))
-                            if r["구분"] == "입고":
+                            if r["구분"] in ("입고", "반품"):
                                 lot_ops.append((pid, ex, conv))
                             elif r["구분"] == "출고":
                                 lot_ops.append((pid, ex, -conv))
@@ -820,12 +835,13 @@ elif page == "📝 일일 기록":
         st.divider()
         st.subheader("최근 기록 (삭제 시 재고 자동 복원)")
 
-        # ── ✏️ 기록 수정: 소비기한·메모·날짜만 (수량·구분은 재고 계산에 영향 → 잠금) ──
-        with st.expander("✏️ 기록 수정 — 소비기한·메모·날짜 (삭제 없이 바로 수정)", expanded=False):
+        # ── ✏️ 기록 수정: 날짜·수량·소비기한·메모 전부 수정 가능 (재고 자동 재반영) ──
+        with st.expander("✏️ 기록 수정 — 날짜·수량·소비기한·메모 전부 수정", expanded=False):
             fix_src = qdf("""
                 SELECT t.id, t.tdate AS 날짜, p.name AS 제품명, t.ttype AS 구분,
                        COALESCE(s.name, CASE WHEN t.region <> '' THEN '(' || t.region || ' 전체)'
                                              ELSE '(총량)' END) AS 매장,
+                       t.product_id, p.box_qty,
                        t.qty_box AS 박스, t.qty_ea AS 낱개,
                        t.expiry_date AS 소비기한, t.memo AS 메모
                 FROM transactions t
@@ -836,57 +852,77 @@ elif page == "📝 일일 기록":
                 st.info("수정할 기록이 없습니다.")
             else:
                 fq = st.text_input("🔍 수정할 기록 검색", key="fix_tx_search",
-                                   placeholder="제품명·메모 일부 입력 (예: 카스테라, 밀양)")
+                                   placeholder="제품명·구분·메모 일부 입력 (예: 카스테라, 반품)")
                 fix_view = fix_src
                 if fq:
                     m = fix_src.apply(lambda r: r.astype(str).str.contains(
                         fq, case=False, na=False, regex=False).any(), axis=1)
                     fix_view = fix_src[m]
-                fix_grid = fix_view.copy()
-                # 날짜형 편집을 위해 변환 (빈 소비기한 = NaT 허용)
+                fix_grid = fix_view[["id", "날짜", "제품명", "구분", "매장", "박스", "낱개", "소비기한", "메모"]].copy()
                 fix_grid["날짜"] = pd.to_datetime(fix_grid["날짜"], errors="coerce")
-                fix_grid["소비기한"] = pd.to_datetime(
-                    fix_grid["소비기한"].replace("", pd.NA), errors="coerce")
+                fix_grid["소비기한"] = pd.to_datetime(fix_grid["소비기한"].replace("", pd.NA), errors="coerce")
 
+                st.caption("날짜·수량(박스/낱개)·소비기한·메모를 고칠 수 있습니다. 저장하면 재고(로트)에 자동 반영됩니다. "
+                           "제품·구분·매장을 바꾸려면 삭제 후 다시 입력하세요.")
                 fixed = st.data_editor(
                     fix_grid, hide_index=True, use_container_width=True,
-                    disabled=["id", "제품명", "구분", "매장", "박스", "낱개"],
+                    disabled=["id", "제품명", "구분", "매장"],
                     column_config={
                         "id": st.column_config.NumberColumn("ID", width="small"),
                         "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
+                        "박스": st.column_config.NumberColumn("박스", min_value=0, step=1),
+                        "낱개": st.column_config.NumberColumn("낱개", min_value=0, step=1),
                         "소비기한": st.column_config.DateColumn("소비기한", format="YYYY-MM-DD",
-                                                             help="비우면 '기한 없음'으로 저장됩니다"),
+                                                             help="비우면 '기한 없음'"),
                         "메모": st.column_config.TextColumn("메모"),
                     }, key="fix_tx_editor")
 
-                if st.button("💾 수정 저장", type="primary", use_container_width=True, key="fix_tx_save"):
+                if st.button("💾 수정 저장 (재고 자동 반영)", type="primary", use_container_width=True, key="fix_tx_save"):
                     def _dstr(v):
                         return "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d")
+
+                    def _eff2(tt, conv):
+                        return conv if tt in ("입고", "반품") else (-conv if tt == "출고" else 0)
+
                     old_map = {int(r["id"]): r for _, r in fix_view.iterrows()}
-                    ops, n_fix = [], 0
+                    ops, lot_ops, n_fix = [], [], 0
                     for _, r in fixed.iterrows():
-                        rid = int(r["id"])
-                        old = old_map.get(rid)
+                        rid = int(r["id"]); old = old_map.get(rid)
                         if old is None:
                             continue
+                        bq = bq_of(old["box_qty"]); tt = str(old["구분"]); pid = int(old["product_id"])
                         new_d, new_e = _dstr(r["날짜"]), _dstr(r["소비기한"])
                         new_m = "" if pd.isna(r["메모"]) else str(r["메모"])
-                        if (str(old["날짜"]), str(old["소비기한"] or ""), str(old["메모"] or "")) != (new_d, new_e, new_m):
+                        new_qb = int(r["박스"]) if pd.notna(r["박스"]) else 0
+                        new_qe = int(r["낱개"]) if pd.notna(r["낱개"]) else 0
+                        old_e = str(old["소비기한"] or "")
+                        if (str(old["날짜"]), old_e, str(old["메모"] or ""), int(old["박스"]), int(old["낱개"])) != (
+                                new_d, new_e, new_m, new_qb, new_qe):
                             if not new_d:
-                                st.warning(f"#{rid}: 날짜는 비울 수 없어 건너뜀")
-                                continue
-                            ops.append(("UPDATE transactions SET tdate=:d, expiry_date=:e, memo=:m WHERE id=:i",
-                                        dict(d=new_d, e=new_e, m=new_m, i=rid)))
+                                st.warning(f"#{rid}: 날짜는 비울 수 없어 건너뜀"); continue
+                            # 재고 재반영: 옛 효과 되돌리고(로트) 새 효과 적용
+                            old_conv = int(old["박스"]) * bq + int(old["낱개"])
+                            new_conv = new_qb * bq + new_qe
+                            lot_ops.append((pid, old_e, -_eff2(tt, old_conv)))   # 되돌림
+                            lot_ops.append((pid, new_e, _eff2(tt, new_conv)))    # 새 적용
+                            ops.append(("UPDATE transactions SET tdate=:d, qty_box=:qb, qty_ea=:qe, "
+                                        "expiry_date=:e, memo=:m WHERE id=:i",
+                                        dict(d=new_d, qb=new_qb, qe=new_qe, e=new_e, m=new_m, i=rid)))
                             ops.append(log_op(str(old["제품명"]), "기록수정",
-                                              f"#{rid} 날짜 {old['날짜']} / 기한 {old['소비기한'] or '없음'} / 메모 {old['메모'] or '-'}",
-                                              f"날짜 {new_d} / 기한 {new_e or '없음'} / 메모 {new_m or '-'}"))
+                                              f"#{rid} {tt} {old['박스']}박스 {old['낱개']}낱개 / {old['날짜']} / 기한 {old_e or '없음'}",
+                                              f"{new_qb}박스 {new_qe}낱개 / {new_d} / 기한 {new_e or '없음'}"))
                             n_fix += 1
                     if n_fix == 0:
                         st.info("변경된 내용이 없습니다.")
                     else:
                         run_batch(ops)
+                        for _pid, _ex, _q in lot_ops:
+                            if _q > 0:
+                                lot_add(_pid, _ex, _q)
+                            elif _q < 0:
+                                lot_consume(_pid, -_q, _ex)
                         clear_cache("fix_tx_editor")
-                        st.success(f"✅ {n_fix}건 수정 완료 — 소비기한 잔여 수량에 즉시 반영됩니다.")
+                        st.success(f"✅ {n_fix}건 수정 완료 — 재고에 즉시 반영됩니다.")
                         st.rerun()
         tx = df_transactions()
         if tx.empty:
@@ -908,7 +944,7 @@ elif page == "📝 일일 기록":
                     pr2 = prods[prods["id"] == int(r["product_id"])].iloc[0]
                     conv = int(r["qty_box"]) * bq_of(pr2["box_qty"]) + int(r["qty_ea"])
                     run("DELETE FROM transactions WHERE id=:i", i=int(del_id))
-                    if r["ttype"] == "입고":       # 입고 취소 → 로트 차감
+                    if r["ttype"] in ("입고", "반품"):   # 입고/반품 취소 → 로트 차감
                         lot_consume(int(r["product_id"]), conv, str(r["expiry_date"] or ""))
                     elif r["ttype"] == "출고":     # 출고 취소 → 로트 복원
                         lot_add(int(r["product_id"]), str(r["expiry_date"] or ""), conv)
@@ -918,66 +954,62 @@ elif page == "📝 일일 기록":
 
 
 # ══════════════════════════════════════════════
-# 수불부 — 일자별 누적이 오늘 재고로 반영
+# 재고 현황 — 제품별 재고(로트 합계) + 소비기한 로트
 # ══════════════════════════════════════════════
-elif page == "📈 일자별 누적(수불부)":
-    st.title("📈 일자별 누적 재고 (수불부)")
-    st.caption("매일 기록한 입고·출고 합계가 날짜순으로 누적되어 오늘의 재고에 반영됩니다. 수량은 전부 낱개 환산 기준입니다.")
+elif page == "📦 재고 현황":
+    st.title("📦 재고 현황")
+    st.caption("재고는 소비기한 로트의 합계입니다. 수량 조정은 [입출고]에서 출고/입고로, 세부 로트는 [제품 관리 → 로트 직접 편집]에서.")
 
     prods = df_products()
     if prods.empty:
-        st.info("제품을 먼저 등록하세요.")
+        st.info("제품을 먼저 등록하세요. (설정 → 제품 관리)")
     else:
-        sel = st.selectbox("제품 선택", ["(전체 요약)"] + prods["name"].tolist())
+        tab_p, tab_e = st.tabs(["📋 제품별 재고", "⏳ 소비기한별 로트"])
 
-        if sel == "(전체 요약)":
-            led = build_ledger()
-            if led.empty:
-                st.info("입고/출고 기록이 아직 없습니다.")
+        with tab_p:
+            v = prods.copy()
+            v["현재고"] = v.apply(total_ea, axis=1)
+            v["박스환산"] = v.apply(lambda r: fmt_stock_ea(int(r["현재고"]), r["box_qty"]), axis=1)
+            v = v[["name", "barcode", "box_qty", "storage", "현재고", "박스환산", "safety_ea"]]
+            v.columns = ["제품명", "바코드", "박스입수량", "보관", "현재고(낱개환산)", "박스환산(자동)", "안전재고"]
+            v = search_box(v, "stk_search", "🔍 제품 검색")
+
+            def _hl(row):
+                s = int(row["안전재고"] or 0)
+                if s > 0:
+                    return ["background-color: #E8F5E9" if int(row["현재고(낱개환산)"]) >= s
+                            else "background-color: #FFEBEE"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(v.style.apply(_hl, axis=1), use_container_width=True, hide_index=True,
+                         column_config={"현재고(낱개환산)": st.column_config.NumberColumn(
+                             "🔵 현재고(낱개환산)")})
+            st.caption("🟩 안전재고 충족 · 🟥 미달 · 무색 = 안전재고 미설정")
+            csv_button(v, "재고현황", "csv_stock_now")
+
+        with tab_e:
+            bd = expiry_breakdown()
+            if bd.empty:
+                st.info("소비기한이 있는 재고 로트가 없습니다. [입출고]에서 입고 시 소비기한을 입력하세요.")
             else:
-                # 제품별 최종 누적 = 현재 재고 확인 요약
-                last = led.sort_values("날짜").groupby("제품명").tail(1)
-                summary = last[["제품명", "기초재고", "누적재고"]].copy()
-                summary["총입고"] = led.groupby("제품명")["입고"].sum().reindex(summary["제품명"]).values
-                summary["총출고"] = led.groupby("제품명")["출고"].sum().reindex(summary["제품명"]).values
-                summary = summary[["제품명", "기초재고", "총입고", "총출고", "누적재고"]]
-                summary.columns = ["제품명", "기초재고", "누적 입고합", "누적 출고합", "오늘 재고(환산낱개)"]
-                st.subheader("제품별 누적 요약 — 기초 + 입고합 − 출고합 = 오늘 재고")
-                st.dataframe(summary, use_container_width=True, hide_index=True)
-                st.subheader("전체 일자별 내역")
-                led_view = search_box(led.drop(columns=["pid", "기초재고"]), "search_led", "🔍 제품 검색")
-                st.dataframe(led_view, use_container_width=True, hide_index=True)
-                csv_button(led.drop(columns=["pid"]), "수불부전체", "csv_led")
-        else:
-            prow = prods[prods["name"] == sel].iloc[0]
-            led = build_ledger(int(prow["id"]))
-            if led.empty:
-                st.info(f"'{sel}' 의 입고/출고 기록이 아직 없습니다.")
-            else:
-                start = int(led.iloc[0]["기초재고"])
-                cur = total_ea(prow)
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("기초재고(환산낱개)", f"{start:,}")
-                c2.metric("누적 입고합", f"{int(led['입고'].sum()):,}")
-                c3.metric("누적 출고합", f"{int(led['출고'].sum()):,}")
-                c4.metric("오늘 재고(환산낱개)", f"{cur:,}",
-                          help="기초재고 + 입고합 − 출고합 (재고 박스×입수량+낱개와 일치)")
-                st.line_chart(led.set_index("날짜")["누적재고"])
-                view = led.drop(columns=["pid", "제품명", "기초재고"])
-                st.dataframe(view, use_container_width=True, hide_index=True)
-                # 일자별 수불부 엑셀
-                buf = io.BytesIO()
-                with pd.ExcelWriter(buf, engine="openpyxl") as w:
-                    view.to_excel(w, sheet_name="수불부", index=False)
-                st.download_button(f"📥 '{sel}' 수불부 엑셀 다운로드", data=buf.getvalue(),
-                                   file_name=f"수불부_{sel}_{TODAY()}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
+                bd2 = search_box(bd, "stk_exp_search", "🔍 제품 검색")
+
+                def _hle(row):
+                    try:
+                        dd = (pd.Timestamp(str(row["소비기한"])).date() - today_kst()).days
+                    except Exception:
+                        return [""] * len(row)
+                    if dd < 0:
+                        return ["background-color: #FFEBEE"] * len(row)
+                    if dd <= 30:
+                        return ["background-color: #FFF8E1"] * len(row)
+                    return [""] * len(row)
+
+                st.dataframe(bd2.style.apply(_hle, axis=1), use_container_width=True, hide_index=True)
+                st.caption("🟥 기한 경과 · 🟨 30일 이내 · 각 행 = 소비기한별 남은 수량(로트)")
+                csv_button(bd2, "소비기한로트", "csv_stock_lots")
 
 
-# ══════════════════════════════════════════════
-# 3. 제품 관리 — 엑셀형 그리드
-# ══════════════════════════════════════════════
 elif page == "📦 제품 관리(엑셀표)":
     st.title("📦 제품 관리 — 엑셀처럼 직접 수정")
     st.caption("셀을 터치/더블클릭해 수정 → [변경사항 저장]. 맨 아래 빈 줄에 입력하면 신규 제품 추가. 수정 내용은 변경이력에 자동 기록됩니다.")
