@@ -42,15 +42,24 @@ if not check_password():
     st.stop()
 
 # ── 로그인 후에만 DB 연결·백엔드 로딩 (core.py) ──
-from core import *  # noqa: E402,F401,F403
+try:
+    import core as _core
+except Exception as _e:
+    import traceback as _tb
+    st.error("⚠️ core.py 를 불러오지 못했습니다. app.py 와 core.py 를 **함께** 최신으로 올렸는지 확인하세요.")
+    st.code(f"{type(_e).__name__}: {_e}\n\n{_tb.format_exc()}")
+    st.stop()
 
-# 두 파일(app.py + core.py) 버전이 어긋나면 여기서 친절히 안내 (조용한 오류 방지)
-_need = ["SCHEMA_VERSION", "LOGIC_VERSION", "KST_NOW", "TODAY", "today_kst",
-         "KOR_WEEKDAY", "DAY_OPTIONS", "DAY_COLORS", "TTYPE_OPTIONS", "fmt_stock_ea"]
-_missing = [n for n in _need if n not in dir()]
-if _missing:
-    st.error("⚠️ core.py 가 예전 버전입니다. app.py 와 core.py 를 **함께** 최신으로 올려주세요.\n\n"
-             f"현재 core.py 에 없는 항목: {', '.join(_missing)}")
+# core의 공개 이름(밑줄 없는 것)을 현재 전역으로 가져오기
+_g = globals()
+for _name in dir(_core):
+    if not _name.startswith("_"):
+        _g[_name] = getattr(_core, _name)
+
+# 버전 확인 (구버전 core 감지)
+if not hasattr(_core, "LOGIC_VERSION") or not hasattr(_core, "fmt_stock_ea"):
+    st.error("⚠️ core.py 가 예전 버전입니다. 저장소 루트의 core.py 를 이번 최신 파일로 교체 후 다시 배포하세요.")
+    st.info(f"현재 불러온 core.py 위치: {getattr(_core, '__file__', '알 수 없음')}")
     st.stop()
 
 if not st.session_state.get("snapshot_done"):
