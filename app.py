@@ -48,9 +48,172 @@ if not st.session_state.get("snapshot_done"):
     snapshot_today()
     st.session_state["snapshot_done"] = True
 
+@st.dialog("📆 날짜별 기록 관리", width="large")
+def open_day_dialog(dsel: str):
+    """달력에서 날짜 클릭 시 열리는 모달: 그날의 일정 요약 + 기록 추가/수정/삭제 통합 표"""
+    d_obj = pd.Timestamp(dsel).date()
+    st.markdown(f"### {dsel} ({KOR_WEEKDAY[d_obj.weekday()]}요일)")
+
+    # 오늘의 일정 요약 (정기납품 / 발주마감 / 소비기한)
+    lines = []
+    stores_all = df_stores()
+    if not stores_all.empty:
+        wd = KOR_WEEKDAY[d_obj.weekday()]
+        due = [s["name"] for _, s in stores_all.iterrows()
+               if wd in str(s["delivery_day"] or "").split(",") or "매일" in str(s["delivery_day"] or "")]
+        if due:
+            lines.append("🚚 정기 납품: " + ", ".join(due))
+    try:
+        _sched = replacement_schedule(int(get_setting("buffer_days", "2")),
+                                      int(get_setting("cutoff_days", "2")),
+                                      get_setting("cutoff_time", "11:30"))
+        if not _sched.empty:
+            cut = _sched[_sched["_cutoff"].astype(str).str[:10] == dsel]
+            if not cut.empty:
+                lines.append("🧾 발주마감: " + ", ".join(cut["제품명"].unique()[:6]))
+            expd = _sched[_sched["소비기한"] == dsel]
+            if not expd.empty:
+                lines.append("⏳ 소비기한 도래: " + ", ".join(expd["제품명"].unique()[:6]))
+    except Exception:
+        pass
+    if lines:
+        st.info(" · ".join(lines))
+
+    prods = df_products()
+    stores = df_stores()
+    if prods.empty:
+        st.warning("제품을 먼저 등록하세요.")
+        return
+    store_opts = store_select_options(stores)
+
+    def _store_label(row):
+        if pd.notna(row["store_id"]):
+            hit = stores[stores["id"] == int(row["store_id"])]
+            if not hit.empty:
+                return hit.iloc[0]["name"]
+        if str(row["region"] or ""):
+            return f"🗺️ {row['region']} 전체"
+        return "(총량 / 매장 미지정)"
+
+    day_tx = qdf("""SELECT t.id, t.product_id, t.store_id, t.region,
+                           p.name AS 제품명, t.ttype AS 구분,
+                           t.qty_box AS 박스, t.qty_ea AS 낱개,
+                           t.expiry_date AS 소비기한, t.memo AS 메모
+                    FROM transactions t JOIN products p ON p.id = t.product_id
+                    WHERE t.tdate = :d ORDER BY t.id""", d=dsel)
+    grid = pd.DataFrame(columns=["id", "제품명", "구분", "매장", "박스", "낱개", "소비기한", "메모"])
+    if not day_tx.empty:
+        grid = day_tx.copy()
+        grid["매장"] = grid.apply(_store_label, axis=1)
+        grid["소비기한"] = pd.to_datetime(grid["소비기한"].replace("", pd.NA), errors="coerce")
+        grid = grid[["id", "제품명", "구분", "매장", "박스", "낱개", "소비기한", "메모"]]
+    else:
+        grid["소비기한"] = pd.Series(dtype="datetime64[ns]")
+
+    st.caption("행 추가 = 맨 아래 빈 줄 입력 · 삭제 = 행 선택 후 Delete · 수량/기한/메모 수정 = 셀 클릭. 저장 시 재고가 자동 반영됩니다.")
+    edited = st.data_editor(
+        grid, num_rows="dynamic", hide_index=True, use_container_width=True,
+        disabled=["id"],
+        column_config={
+            "id": st.column_config.NumberColumn("ID", width="small"),
+            "제품명": st.column_config.SelectboxColumn("제품명", options=prods["name"].tolist(), required=True),
+            "구분": st.column_config.SelectboxColumn("구분", options=TTYPE_OPTIONS, default="출고"),
+            "매장": st.column_config.SelectboxColumn("매장", options=store_opts, default="(총량 / 매장 미지정)"),
+            "박스": st.column_config.NumberColumn("박스", min_value=0, step=1, default=0),
+            "낱개": st.column_config.NumberColumn("낱개", min_value=0, step=1, default=0),
+            "소비기한": st.column_config.DateColumn("소비기한", format="YYYY-MM-DD"),
+            "메모": st.column_config.TextColumn("메모"),
+        }, key=f"day_editor_{dsel}")
+
+    if st.button("💾 저장 (재고 자동 반영)", type="primary", use_container_width=True,
+                 key=f"day_save_{dsel}"):
+        prow_map = {r["name"]: r for _, r in prods.iterrows()}
+        old_map = {int(r["id"]): r for _, r in day_tx.iterrows()} if not day_tx.empty else {}
+
+        def _eff(tt, qb, qe, bq):
+            if tt == "입고":
+                return qb * bq + qe
+            if tt == "출고":
+                return -(qb * bq + qe)
+            return 0
+
+        def _dstr(v):
+            return "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d")
+
+        ops, deltas, seen, n_chg = [], {}, set(), 0
+        for _, r in edited.iterrows():
+            if pd.isna(r["제품명"]) or str(r["제품명"]) not in prow_map:
+                continue
+            pr = prow_map[str(r["제품명"])]
+            pid = int(pr["id"])
+            bq = bq_of(pr["box_qty"])
+            qb = int(r["박스"]) if pd.notna(r["박스"]) else 0
+            qe = int(r["낱개"]) if pd.notna(r["낱개"]) else 0
+            tt = r["구분"] if r["구분"] in TTYPE_OPTIONS else "출고"
+            sid, region = parse_store_choice(str(r["매장"]), stores)
+            ex = _dstr(r["소비기한"])
+            mm = "" if pd.isna(r["메모"]) else str(r["메모"])
+            rid = r["id"]
+            if pd.notna(rid) and int(rid) in old_map:      # 기존 행: 변경 감지 + 수량 델타
+                rid = int(rid); seen.add(rid)
+                o = old_map[rid]
+                o_bq = bq_of(prow_map.get(str(o["제품명"]), pr)["box_qty"])
+                o_sid = int(o["store_id"]) if pd.notna(o["store_id"]) else None
+                if (str(o["제품명"]), o["구분"], int(o["박스"]), int(o["낱개"]),
+                        str(o["소비기한"] or ""), str(o["메모"] or ""), o_sid, str(o["region"] or "")) != (
+                        str(r["제품명"]), tt, qb, qe, ex, mm, sid, region):
+                    old_pid = int(o["product_id"])
+                    deltas[old_pid] = deltas.get(old_pid, 0) - _eff(o["구분"], int(o["박스"]), int(o["낱개"]), o_bq)
+                    deltas[pid] = deltas.get(pid, 0) + _eff(tt, qb, qe, bq)
+                    ops.append(("UPDATE transactions SET product_id=:p, ttype=:t, store_id=:s, region=:rg, "
+                                "qty_box=:qb, qty_ea=:qe, expiry_date=:ex, memo=:m WHERE id=:i",
+                                dict(p=pid, t=tt, s=sid, rg=region, qb=qb, qe=qe, ex=ex, m=mm, i=rid)))
+                    ops.append(log_op(str(r["제품명"]), "기록수정",
+                                      f"#{rid} {o['구분']} {o['박스']}박스 {o['낱개']}낱개 기한 {o['소비기한'] or '없음'}",
+                                      f"{tt} {qb}박스 {qe}낱개 기한 {ex or '없음'}"))
+                    n_chg += 1
+            else:                                           # 신규 행
+                if qb == 0 and qe == 0:
+                    continue
+                deltas[pid] = deltas.get(pid, 0) + _eff(tt, qb, qe, bq)
+                ops.append(("INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, "
+                            "region, expiry_date, memo, created_at) VALUES (:d,:p,:t,:s,:qb,:qe,:rg,:ex,:m,:c)",
+                            dict(d=dsel, p=pid, t=tt, s=sid, qb=qb, qe=qe, rg=region, ex=ex, m=mm, c=KST_NOW())))
+                ops.append(log_op(str(r["제품명"]), "기록추가", "(달력)", f"{dsel} {tt} {qb}박스 {qe}낱개"))
+                n_chg += 1
+
+        for rid, o in old_map.items():                       # 삭제된 행: 재고 복원
+            if rid not in seen:
+                o_pid = int(o["product_id"])
+                o_bq = bq_of(prow_map.get(str(o["제품명"]), {"box_qty": 1})["box_qty"]) if str(o["제품명"]) in prow_map else 1
+                deltas[o_pid] = deltas.get(o_pid, 0) - _eff(o["구분"], int(o["박스"]), int(o["낱개"]), o_bq)
+                ops.append(("DELETE FROM transactions WHERE id=:i", {"i": rid}))
+                ops.append(log_op(str(o["제품명"]), "기록삭제", f"#{rid} {o['구분']} {o['박스']}박스 {o['낱개']}낱개", "(달력에서 삭제)"))
+                n_chg += 1
+
+        # 제품별 재고 델타 반영 (박스/낱개 재배분)
+        for pid, delta in deltas.items():
+            if delta == 0:
+                continue
+            pr = [p for p in prow_map.values() if int(p["id"]) == pid][0]
+            bq = bq_of(pr["box_qty"])
+            total = int(pr["stock_box"]) * bq + int(pr["stock_ea"]) + delta
+            nb, ne = (total // bq, total % bq) if total >= 0 else (0, total)
+            ops.append(("UPDATE products SET stock_box=:b, stock_ea=:e, updated_at=:u WHERE id=:i",
+                        dict(b=nb, e=ne, u=KST_NOW(), i=pid)))
+
+        if n_chg == 0:
+            st.info("변경된 내용이 없습니다.")
+        else:
+            run_batch(ops)
+            clear_cache(f"day_editor_{dsel}")
+            st.success(f"✅ {dsel} · {n_chg}건 반영 완료")
+            st.rerun()
+
+
 def render_schedule_calendar(sched: pd.DataFrame, cutt: str, key_prefix: str = "cal"):
-    """교체·발주 달력 렌더링 (대시보드/일정 페이지 공용). key_prefix로 위젯 충돌 방지."""
-    st.subheader("🗓️ 교체·발주 달력")
+    """클릭형 교체·발주 달력: 날짜를 누르면 그날 기록을 추가/수정/삭제하는 모달이 열립니다."""
+    st.subheader("🗓️ 교체·발주 달력 — 날짜를 클릭하면 기록 관리 팝업")
     okey = f"{key_prefix}_cal_offset"
     if okey not in st.session_state:
         st.session_state[okey] = 0
@@ -66,31 +229,29 @@ def render_schedule_calendar(sched: pd.DataFrame, cutt: str, key_prefix: str = "
     year, month = base.year + ym // 12, ym % 12 + 1
     ctitle.markdown(f"<h3 style='text-align:center'>{year}년 {month}월</h3>", unsafe_allow_html=True)
 
-    events = {}
+    # 날짜별 이벤트 집계 (배지 표시용)
+    ev = {}
 
-    def _add(dstr, label, css):
+    def _bump(dstr, k):
         try:
             d = pd.Timestamp(dstr).date()
         except Exception:
             return
-        events.setdefault(d, [])
-        if (label, css) not in events[d]:
-            events[d].append((label, css))
+        ev.setdefault(d, {"🚚": 0, "🧾": 0, "🔄": 0, "⏳": 0})
+        ev[d][k] += 1
 
     if sched is not None and not sched.empty:
         for _, r in sched.iterrows():
             if r.get("_cutoff") and r["_cutoff"] != "-":
-                _add(str(r["_cutoff"])[:10], f"🧾 발주마감 {cutt} · {r['제품명'][:8]}",
-                     "background:#FFE0B2;")
+                _bump(str(r["_cutoff"])[:10], "🧾")
             if r.get("_L") and r["_L"] != "-":
-                _add(r["_L"], f"🔄 교체납품 · {r['제품명'][:8]} → {r['매장'][:6]}",
-                     "background:#E3F2FD;")
-            _add(r["소비기한"], f"⏳ 소비기한 · {r['제품명'][:8]}", "background:#FFEBEE;")
-
+                _bump(r["_L"], "🔄")
+            _bump(r["소비기한"], "⏳")
     stores_all = df_stores()
+    import calendar as _cal
+    weeks = _cal.Calendar(firstweekday=0).monthdatescalendar(year, month)
     if not stores_all.empty:
-        import calendar as _cal
-        for week in _cal.Calendar().monthdatescalendar(year, month):
+        for week in weeks:
             for d in week:
                 if d.month != month:
                     continue
@@ -98,11 +259,27 @@ def render_schedule_calendar(sched: pd.DataFrame, cutt: str, key_prefix: str = "
                 for _, s in stores_all.iterrows():
                     days = str(s["delivery_day"] or "").split(",")
                     if wd in days or "매일" in days:
-                        _add(d.strftime("%Y-%m-%d"), f"🚚 {s['name'][:8]}",
-                             "background:#E8F5E9;")
+                        _bump(d.strftime("%Y-%m-%d"), "🚚")
 
-    st.markdown(build_calendar_html(year, month, events), unsafe_allow_html=True)
-    st.caption("🟩 정기 납품(매장) · 🟦 교체 납품(로트) · 🟧 발주마감 · 🟥 소비기한 · 주황 테두리 = 오늘")
+    hdr = st.columns(7)
+    for i, nm in enumerate(["월", "화", "수", "목", "금", "토", "일"]):
+        hdr[i].markdown(f"<div style='text-align:center;font-weight:700'>{nm}</div>", unsafe_allow_html=True)
+    today = today_kst()
+    for week in weeks:
+        cols = st.columns(7)
+        for i, d in enumerate(week):
+            with cols[i]:
+                if d.month != month:
+                    st.button(" ", key=f"{key_prefix}_pad_{d}", disabled=True, use_container_width=True)
+                    st.caption(" ")
+                    continue
+                btype = "primary" if d == today else "secondary"
+                if st.button(f"{d.day}", key=f"{key_prefix}_day_{d}", type=btype, use_container_width=True):
+                    open_day_dialog(d.strftime("%Y-%m-%d"))
+                badges = ev.get(d, {})
+                txt = " ".join(f"{k}{v}" for k, v in badges.items() if v)
+                st.caption(txt if txt else " ")
+    st.caption("🚚 정기납품 · 🔄 교체납품 · 🧾 발주마감 · ⏳ 소비기한 — 날짜 버튼을 누르면 그날의 기록을 팝업에서 바로 추가·수정·삭제할 수 있습니다.")
 
 
 st.sidebar.title("📦 삼립 무인편의점 재고관리")
@@ -585,6 +762,75 @@ elif page == "📝 일일 기록":
 
         st.divider()
         st.subheader("최근 기록 (삭제 시 재고 자동 복원)")
+
+        # ── ✏️ 기록 수정: 소비기한·메모·날짜만 (수량·구분은 재고 계산에 영향 → 잠금) ──
+        with st.expander("✏️ 기록 수정 — 소비기한·메모·날짜 (삭제 없이 바로 수정)", expanded=False):
+            fix_src = qdf("""
+                SELECT t.id, t.tdate AS 날짜, p.name AS 제품명, t.ttype AS 구분,
+                       COALESCE(s.name, CASE WHEN t.region <> '' THEN '(' || t.region || ' 전체)'
+                                             ELSE '(총량)' END) AS 매장,
+                       t.qty_box AS 박스, t.qty_ea AS 낱개,
+                       t.expiry_date AS 소비기한, t.memo AS 메모
+                FROM transactions t
+                JOIN products p ON p.id = t.product_id
+                LEFT JOIN stores s ON s.id = t.store_id
+                ORDER BY t.tdate DESC, t.id DESC LIMIT 200""")
+            if fix_src.empty:
+                st.info("수정할 기록이 없습니다.")
+            else:
+                fq = st.text_input("🔍 수정할 기록 검색", key="fix_tx_search",
+                                   placeholder="제품명·메모 일부 입력 (예: 카스테라, 밀양)")
+                fix_view = fix_src
+                if fq:
+                    m = fix_src.apply(lambda r: r.astype(str).str.contains(
+                        fq, case=False, na=False, regex=False).any(), axis=1)
+                    fix_view = fix_src[m]
+                fix_grid = fix_view.copy()
+                # 날짜형 편집을 위해 변환 (빈 소비기한 = NaT 허용)
+                fix_grid["날짜"] = pd.to_datetime(fix_grid["날짜"], errors="coerce")
+                fix_grid["소비기한"] = pd.to_datetime(
+                    fix_grid["소비기한"].replace("", pd.NA), errors="coerce")
+
+                fixed = st.data_editor(
+                    fix_grid, hide_index=True, use_container_width=True,
+                    disabled=["id", "제품명", "구분", "매장", "박스", "낱개"],
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", width="small"),
+                        "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
+                        "소비기한": st.column_config.DateColumn("소비기한", format="YYYY-MM-DD",
+                                                             help="비우면 '기한 없음'으로 저장됩니다"),
+                        "메모": st.column_config.TextColumn("메모"),
+                    }, key="fix_tx_editor")
+
+                if st.button("💾 수정 저장", type="primary", use_container_width=True, key="fix_tx_save"):
+                    def _dstr(v):
+                        return "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d")
+                    old_map = {int(r["id"]): r for _, r in fix_view.iterrows()}
+                    ops, n_fix = [], 0
+                    for _, r in fixed.iterrows():
+                        rid = int(r["id"])
+                        old = old_map.get(rid)
+                        if old is None:
+                            continue
+                        new_d, new_e = _dstr(r["날짜"]), _dstr(r["소비기한"])
+                        new_m = "" if pd.isna(r["메모"]) else str(r["메모"])
+                        if (str(old["날짜"]), str(old["소비기한"] or ""), str(old["메모"] or "")) != (new_d, new_e, new_m):
+                            if not new_d:
+                                st.warning(f"#{rid}: 날짜는 비울 수 없어 건너뜀")
+                                continue
+                            ops.append(("UPDATE transactions SET tdate=:d, expiry_date=:e, memo=:m WHERE id=:i",
+                                        dict(d=new_d, e=new_e, m=new_m, i=rid)))
+                            ops.append(log_op(str(old["제품명"]), "기록수정",
+                                              f"#{rid} 날짜 {old['날짜']} / 기한 {old['소비기한'] or '없음'} / 메모 {old['메모'] or '-'}",
+                                              f"날짜 {new_d} / 기한 {new_e or '없음'} / 메모 {new_m or '-'}"))
+                            n_fix += 1
+                    if n_fix == 0:
+                        st.info("변경된 내용이 없습니다.")
+                    else:
+                        run_batch(ops)
+                        clear_cache("fix_tx_editor")
+                        st.success(f"✅ {n_fix}건 수정 완료 — 소비기한 잔여 수량에 즉시 반영됩니다.")
+                        st.rerun()
         tx = df_transactions()
         if tx.empty:
             st.info("기록이 없습니다.")
