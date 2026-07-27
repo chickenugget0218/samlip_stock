@@ -904,6 +904,80 @@ def _last_delivery_on_or_before(target: date, days: list) -> date | None:
     return None
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def month_grid(year: int, month: int):
+    """제품 × 날짜 격자 데이터.
+    반환: (pivot_df, days, day_totals, meta)
+      pivot_df: 행=제품, 열=날짜 문자열, 값='입고/출고/반품' 요약 텍스트
+      days: 그 달의 날짜 리스트(date)
+      day_totals: 날짜별 (입고합, 출고합, 반품합) 낱개환산
+      meta: 제품별 {소비기한잔여, 교체마감요약}
+    """
+    import calendar as _cal
+    from datetime import date as _date
+    ndays = _cal.monthrange(year, month)[1]
+    days = [_date(year, month, d) for d in range(1, ndays + 1)]
+    d1 = f"{year:04d}-{month:02d}-01"
+    d2 = f"{year:04d}-{month:02d}-{ndays:02d}"
+
+    tx = qdf("""SELECT t.tdate AS 날짜, p.name AS 제품명, t.ttype AS 구분, p.box_qty,
+                       (t.qty_box*GREATEST(p.box_qty,1)+t.qty_ea) AS 환산
+                FROM transactions t JOIN products p ON p.id=t.product_id
+                WHERE t.ttype IN ('입고','출고','반품') AND t.tdate BETWEEN :a AND :b""",
+             a=d1, b=d2)
+    prods = qdf("SELECT name, box_qty FROM products ORDER BY name")
+    if prods.empty:
+        return None, days, {}, {}
+
+    bqmap = dict(zip(prods["name"], prods["box_qty"]))
+    # 셀별 집계: {(제품, 날짜): {입고,출고,반품}}
+    cell = {}
+    day_tot = {d.strftime("%Y-%m-%d"): [0, 0, 0] for d in days}
+    if not tx.empty:
+        for _, r in tx.iterrows():
+            key = (r["제품명"], str(r["날짜"]))
+            cell.setdefault(key, {"입고": 0, "출고": 0, "반품": 0})
+            cell[key][r["구분"]] += int(r["환산"])
+            idx = {"입고": 0, "출고": 1, "반품": 2}[r["구분"]]
+            if str(r["날짜"]) in day_tot:
+                day_tot[str(r["날짜"])][idx] += int(r["환산"])
+
+    def _fmt(c):
+        parts = []
+        if c["입고"]: parts.append(f"+{c['입고']}")
+        if c["출고"]: parts.append(f"-{c['출고']}")
+        if c["반품"]: parts.append(f"↺{c['반품']}")
+        return "\n".join(parts)
+
+    rows = []
+    for pname in prods["name"]:
+        row = {"제품명": pname}
+        rtot = 0
+        for d in days:
+            ds = d.strftime("%Y-%m-%d")
+            c = cell.get((pname, ds))
+            row[ds] = _fmt(c) if c else ""
+            if c:
+                rtot += c["입고"] - c["출고"] + c["반품"]
+        row["_순합계"] = rtot
+        rows.append(row)
+    pivot = pd.DataFrame(rows)
+
+    # 제품별 메타(소비기한 잔여 요약)
+    lots = df_lots()
+    meta = {}
+    if not lots.empty:
+        for pname, g in lots.groupby("제품명"):
+            dated = g[g["소비기한"] != ""]
+            if not dated.empty:
+                nearest = dated.sort_values("소비기한").iloc[0]
+                meta[pname] = f"최단기한 {nearest['소비기한']} · 잔여 {int(g['잔여낱개'].sum())}"
+            else:
+                meta[pname] = f"잔여 {int(g['잔여낱개'].sum())}"
+    return pivot, days, day_tot, meta
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def replacement_schedule(buffer_days: int, cutoff_days: int, cutoff_hm: str) -> pd.DataFrame:
     """소비기한 로트별 교체·발주 일정 역산.

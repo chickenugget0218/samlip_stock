@@ -334,7 +334,9 @@ st.sidebar.title("📦 삼립 무인편의점")
 #  ① 오늘 할 일  ② 입출고(로트 자동반영)  ③ 재고 현황  ④ 메모
 _MAIN = {
     "🏠 오늘 할 일 (달력·발주)": "📊 대시보드",
+    "📅 격자표 (제품×날짜)": "📅 격자표",
     "🔄 입출고 (입고·출고·반품·교체)": "📝 일일 기록",
+    "📅 월별 격자표 (제품×날짜)": "📅 월별 격자표",
     "📦 재고 현황 (제품·소비기한)": "📦 재고 현황",
     "🗒️ 메모": "🗒️ 일자별 메모",
 }
@@ -562,16 +564,6 @@ if page == "📊 대시보드":
     render_schedule_calendar(_sched, _cutt, key_prefix="dash")
 
     st.markdown('<div class="sec-hdr blue">🚚 오늘의 알림</div>', unsafe_allow_html=True)
-    if not prods.empty:
-        _p = prods.copy()
-        _p["총낱개환산"] = _p.apply(total_ea, axis=1)
-        low = _p[(_p["safety_ea"] > 0) & (_p["총낱개환산"] < _p["safety_ea"])]
-        if not low.empty:
-            st.error(f"⚠️ 안전재고 미달 제품 {len(low)}개 — 발주 검토 필요")
-            _lowv = low[["name", "총낱개환산", "safety_ea"]].rename(columns={
-                "name": "제품명", "총낱개환산": "현재고(낱개환산)", "safety_ea": "안전재고(낱개환산)"})
-            _lowv["부족분"] = _lowv["안전재고(낱개환산)"] - _lowv["현재고(낱개환산)"]
-            st.dataframe(_lowv, use_container_width=True, hide_index=True)
 
     # 오늘 요일에 납품 나가는 매장 (다중 요일 "화,금" 형식 지원)
     today_day = KOR_WEEKDAY[today_kst().weekday()]
@@ -586,51 +578,40 @@ if page == "📊 대시보드":
                     + ", ".join(due["name"].tolist()))
 
 
-    st.markdown('<div class="sec-hdr green">📦 재고 현황</div>', unsafe_allow_html=True)
-    if prods.empty:
-        st.info("등록된 제품이 없습니다. [제품 관리] 메뉴에서 제품을 추가하세요.")
-    else:
-        tab_now, tab_trend = st.tabs(["📋 현재 재고 현황", "📈 일자별 재고 추세 (자동 저장)"])
-        with tab_now:
-            view = prods.copy()
-            view["총낱개환산"] = view.apply(total_ea, axis=1)
-            view["박스환산"] = view.apply(
-                lambda r: fmt_stock_ea(int(r["총낱개환산"]), r["box_qty"]), axis=1)
-            view = view[["name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                         "storage", "delivery_ea", "총낱개환산", "박스환산", "safety_ea"]]
-            view.columns = ["제품명", "바코드", "구분", "박스입수량", "규격(무게)", "정상가", "할인판매가",
-                            "보관방법", "납품갯수(낱개)", "총낱개환산", "박스환산(자동)", "안전재고(낱개환산)"]
+    with st.expander("📦 재고 현황 · 오늘 기록 보기 (열면 계산)", expanded=False):
+        if prods.empty:
+            st.info("등록된 제품이 없습니다. [설정·관리 → 제품 관리]에서 제품을 추가하세요.")
+        else:
+            tab_now, tab_trend = st.tabs(["📋 현재 재고 현황", "📈 일자별 재고 추세 (자동 저장)"])
+            with tab_now:
+                view = prods.copy()
+                view["총낱개환산"] = view.apply(total_ea, axis=1)
+                view["박스환산"] = view.apply(
+                    lambda r: fmt_stock_ea(int(r["총낱개환산"]), r["box_qty"]), axis=1)
+                view = view[["name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
+                             "storage", "delivery_ea", "총낱개환산", "박스환산"]]
+                view.columns = ["제품명", "바코드", "구분", "박스입수량", "규격(무게)", "정상가", "할인판매가",
+                                "보관방법", "납품갯수(낱개)", "총낱개환산", "박스환산(자동)"]
+                st.dataframe(view, use_container_width=True, hide_index=True)
+                csv_button(view, "재고현황", "csv_dash")
+            with tab_trend:
+                snaps = df_snapshots()
+                if snaps.empty:
+                    st.info("접속·저장할 때마다 그날의 재고가 자동 기록됩니다. 내일부터 추세가 그려집니다.")
+                else:
+                    opts = sorted(snaps["제품명"].unique())
+                    pick = st.multiselect("표시할 제품", opts, default=opts[:min(5, len(opts))],
+                                          key="snap_pick")
+                    if pick:
+                        sub = snaps[snaps["제품명"].isin(pick)]
+                        chart = sub.pivot_table(index="날짜", columns="제품명",
+                                                values="재고환산낱개", aggfunc="last")
+                        st.line_chart(chart)
+                        st.caption("매일의 마지막 재고 상태가 날짜별로 자동 저장됩니다. 세로축 = 재고(총낱개환산).")
+                        csv_button(sub, "재고추세", "csv_snap")
 
-            def _row_style(row):
-                s = int(row["안전재고(낱개환산)"] or 0)
-                if s > 0:
-                    ok = int(row["총낱개환산"]) >= s
-                    return [f"background-color: {'#E8F5E9' if ok else '#FFEBEE'}"] * len(row)
-                return [""] * len(row)
-
-            st.dataframe(view.style.apply(_row_style, axis=1),
-                         use_container_width=True, hide_index=True)
-            st.caption("🟩 연초록 = 안전재고 충족 · 🟥 연빨강 = 안전재고 미달 · 무색 = 안전재고 미설정 (제품 관리에서 제품별 입력)")
-            csv_button(view, "재고현황", "csv_dash")
-        with tab_trend:
-            snaps = df_snapshots()
-            if snaps.empty:
-                st.info("접속·저장할 때마다 그날의 재고가 자동 기록됩니다. 내일부터 추세가 그려집니다.")
-            else:
-                opts = sorted(snaps["제품명"].unique())
-                pick = st.multiselect("표시할 제품", opts, default=opts[:min(5, len(opts))],
-                                      key="snap_pick")
-                if pick:
-                    sub = snaps[snaps["제품명"].isin(pick)]
-                    chart = sub.pivot_table(index="날짜", columns="제품명",
-                                            values="재고환산낱개", aggfunc="last")
-                    st.line_chart(chart)
-                    st.caption("제품 관리(엑셀표)에서 수정한 재고를 포함해, 매일의 마지막 재고 상태가 날짜별로 자동 저장됩니다. "
-                               "세로축 = 재고(총낱개환산).")
-                    csv_button(sub, "재고추세", "csv_snap")
-
-    st.subheader("오늘 기록")
-    st.dataframe(tx_today.drop(columns=["id"]), use_container_width=True, hide_index=True)
+            st.subheader("오늘 기록")
+            st.dataframe(tx_today.drop(columns=["id"]), use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════
@@ -954,10 +935,104 @@ elif page == "📝 일일 기록":
 
 
 # ══════════════════════════════════════════════
-# 재고 현황 — 제품별 재고(로트 합계) + 소비기한 로트
+# 월별 격자표 — 제품 × 날짜 (입고+/출고-/반품↺)
 # ══════════════════════════════════════════════
-elif page == "📦 재고 현황":
-    st.title("📦 재고 현황")
+elif page == "📅 월별 격자표":
+    st.title("📅 월별 격자표 (제품 × 날짜)")
+    st.markdown("""
+    <style>
+    .grid-wrap { overflow-x: auto; }
+    table.mgrid { border-collapse: collapse; font-size: .8rem; white-space: nowrap; }
+    table.mgrid th, table.mgrid td { border: 1px solid rgba(128,128,128,.25); padding: 3px 6px; text-align: center; }
+    table.mgrid th.pname, table.mgrid td.pname { text-align: left; position: sticky; left: 0;
+        background: var(--background-color, #fff); font-weight: 700; min-width: 150px; z-index: 2; }
+    table.mgrid th.sat { color:#4D96FF; } table.mgrid th.sun { color:#FF6B6B; }
+    table.mgrid td.wknd { background: rgba(255,107,53,.05); }
+    table.mgrid td.cell { min-width: 46px; line-height: 1.25; }
+    table.mgrid .in { color:#2E7D32; } table.mgrid .out { color:#C62828; } table.mgrid .rt { color:#F57C00; }
+    table.mgrid tr.tot td { font-weight:800; background: rgba(77,150,255,.08); }
+    table.mgrid td.rowtot { font-weight:800; background: rgba(107,203,119,.10); }
+    </style>""", unsafe_allow_html=True)
+
+    if "grid_ym" not in st.session_state:
+        st.session_state["grid_ym"] = today_kst().strftime("%Y-%m")
+    cp, ct, cn = st.columns([1, 2, 1])
+    if cp.button("◀ 이전달", key="grid_prev"):
+        y, m = map(int, st.session_state["grid_ym"].split("-"))
+        m -= 1
+        if m == 0: y, m = y - 1, 12
+        st.session_state["grid_ym"] = f"{y:04d}-{m:02d}"; st.rerun()
+    if cn.button("다음달 ▶", key="grid_next"):
+        y, m = map(int, st.session_state["grid_ym"].split("-"))
+        m += 1
+        if m == 13: y, m = y + 1, 1
+        st.session_state["grid_ym"] = f"{y:04d}-{m:02d}"; st.rerun()
+    gy, gm = map(int, st.session_state["grid_ym"].split("-"))
+    ct.markdown(f"<h3 style='text-align:center'>{gy}년 {gm}월</h3>", unsafe_allow_html=True)
+
+    pivot, days, dtot, meta = month_grid(gy, gm)
+    if pivot is None or pivot.empty:
+        st.info("제품이 없습니다. [설정·관리 → 제품 관리]에서 먼저 등록하세요.")
+    else:
+        q = st.text_input("🔍 제품 검색", key="grid_search", placeholder="제품명 일부 입력")
+        pv = pivot
+        if q:
+            pv = pivot[pivot["제품명"].str.contains(q, case=False, na=False, regex=False)]
+
+        wk = ["월", "화", "수", "목", "금", "토", "일"]
+        # 헤더
+        html = ["<div class='grid-wrap'><table class='mgrid'><thead><tr>",
+                "<th class='pname'>제품명</th>"]
+        for d in days:
+            wd = d.weekday()
+            cls = "sat" if wd == 5 else ("sun" if wd == 6 else "")
+            html.append(f"<th class='{cls}'>{d.day}<br><span style='font-size:.7rem'>{wk[wd]}</span></th>")
+        html.append("<th class='rowtot'>합계</th></tr></thead><tbody>")
+        # 본문
+        for _, r in pv.iterrows():
+            html.append("<tr>")
+            tip = meta.get(r["제품명"], "")
+            html.append(f"<td class='pname' title='{tip}'>{r['제품명']}"
+                        + (f"<br><span style='font-size:.68rem;color:#888;font-weight:400'>{tip}</span>" if tip else "")
+                        + "</td>")
+            for d in days:
+                ds = d.strftime("%Y-%m-%d")
+                wknd = "wknd" if d.weekday() >= 5 else ""
+                val = r.get(ds, "") or ""
+                cellhtml = ""
+                for line in str(val).split("\n"):
+                    if line.startswith("+"):
+                        cellhtml += f"<div class='in'>{line}</div>"
+                    elif line.startswith("-"):
+                        cellhtml += f"<div class='out'>{line}</div>"
+                    elif line.startswith("↺"):
+                        cellhtml += f"<div class='rt'>{line}</div>"
+                html.append(f"<td class='cell {wknd}'>{cellhtml}</td>")
+            html.append(f"<td class='rowtot'>{int(r['_순합계']):+,}</td></tr>")
+        # 하단 일자별 합계 (순 = 입고-출고+반품)
+        html.append("<tr class='tot'><td class='pname'>일자별 순증감</td>")
+        for d in days:
+            ds = d.strftime("%Y-%m-%d")
+            i, o, rt = dtot.get(ds, [0, 0, 0])
+            net = i - o + rt
+            html.append(f"<td>{net:+,}</td>" if net else "<td></td>")
+        html.append("<td class='rowtot'></td></tr>")
+        html.append("</tbody></table></div>")
+        st.markdown("".join(html), unsafe_allow_html=True)
+        st.caption("셀 표시: <span style='color:#2E7D32'>+입고</span> · "
+                   "<span style='color:#C62828'>-출고</span> · "
+                   "<span style='color:#F57C00'>↺반품</span> (낱개환산) · 제품명 아래 = 소비기한 잔여 요약 · "
+                   "토=파랑/일=빨강, 주말 음영", unsafe_allow_html=True)
+
+        st.divider()
+        st.markdown("#### ✏️ 특정 날짜 기록 추가·수정")
+        st.caption("격자에서 고칠 칸의 날짜를 골라 팝업에서 그날 기록을 추가·수정·삭제하세요.")
+        pick_day = st.date_input("날짜 선택", value=today_kst().replace(day=1) if gm != today_kst().month else today_kst(),
+                                 key="grid_pick_day")
+        if st.button("📆 그 날짜 기록 관리 열기", type="primary", key="grid_open_day"):
+            open_day_dialog(pick_day.strftime("%Y-%m-%d"))
+
+
     st.caption("재고는 소비기한 로트의 합계입니다. 수량 조정은 [입출고]에서 출고/입고로, 세부 로트는 [제품 관리 → 로트 직접 편집]에서.")
 
     prods = df_products()
@@ -970,21 +1045,12 @@ elif page == "📦 재고 현황":
             v = prods.copy()
             v["현재고"] = v.apply(total_ea, axis=1)
             v["박스환산"] = v.apply(lambda r: fmt_stock_ea(int(r["현재고"]), r["box_qty"]), axis=1)
-            v = v[["name", "barcode", "box_qty", "storage", "현재고", "박스환산", "safety_ea"]]
-            v.columns = ["제품명", "바코드", "박스입수량", "보관", "현재고(낱개환산)", "박스환산(자동)", "안전재고"]
+            v = v[["name", "barcode", "box_qty", "storage", "현재고", "박스환산"]]
+            v.columns = ["제품명", "바코드", "박스입수량", "보관", "현재고(낱개환산)", "박스환산(자동)"]
             v = search_box(v, "stk_search", "🔍 제품 검색")
-
-            def _hl(row):
-                s = int(row["안전재고"] or 0)
-                if s > 0:
-                    return ["background-color: #E8F5E9" if int(row["현재고(낱개환산)"]) >= s
-                            else "background-color: #FFEBEE"] * len(row)
-                return [""] * len(row)
-
-            st.dataframe(v.style.apply(_hl, axis=1), use_container_width=True, hide_index=True,
+            st.dataframe(v, use_container_width=True, hide_index=True,
                          column_config={"현재고(낱개환산)": st.column_config.NumberColumn(
                              "🔵 현재고(낱개환산)")})
-            st.caption("🟩 안전재고 충족 · 🟥 미달 · 무색 = 안전재고 미설정")
             csv_button(v, "재고현황", "csv_stock_now")
 
         with tab_e:
@@ -1049,12 +1115,12 @@ elif page == "📦 제품 관리(엑셀표)":
         prods_view = prods_view[m]
 
     grid_cols = ["id", "name", "barcode", "is_new", "box_qty", "spec", "normal_price", "sale_price",
-                 "storage", "delivery_ea", "safety_ea", "memo", "updated_at"]
+                 "storage", "delivery_ea", "memo", "updated_at"]
     grid = prods_view[grid_cols].copy() if not prods_view.empty else pd.DataFrame(columns=grid_cols)
     # 현재고(낱개환산)는 로트 합계 → 읽기전용 표시
     _sk = stock_of()
     if not grid.empty:
-        grid.insert(grid.columns.get_loc("safety_ea"), "현재고", grid["id"].apply(lambda i: int(_sk.get(int(i), 0))))
+        grid.insert(grid.columns.get_loc("memo"), "현재고", grid["id"].apply(lambda i: int(_sk.get(int(i), 0))))
     else:
         grid["현재고"] = pd.Series(dtype="int")
 
@@ -1080,9 +1146,6 @@ elif page == "📦 제품 관리(엑셀표)":
             "delivery_ea": st.column_config.NumberColumn("납품갯수(낱개)", min_value=0, step=1),
             "현재고": st.column_config.NumberColumn("현재고(낱개환산)",
                 help="로트 합계로 자동 계산됩니다. 재고 조정은 일일 기록(입고/출고) 또는 '🧺 로트 직접 편집'에서 하세요."),
-            "safety_ea": st.column_config.NumberColumn(
-                "안전재고(낱개환산)", min_value=0, step=1,
-                help="제품별 안전재고. 현재고가 이 값 이상이면 대시보드에서 초록 배경으로 표시"),
             "memo": st.column_config.TextColumn("메모"),
             "updated_at": st.column_config.TextColumn("저장시각(자동)", help="이 행이 마지막으로 저장된 일시"),
         },
@@ -1111,7 +1174,6 @@ elif page == "📦 제품 관리(엑셀표)":
                 "sale_price": int(r["sale_price"]) if pd.notna(r["sale_price"]) else 0,
                 "storage": r["storage"] if r["storage"] in STORAGE_OPTIONS else "상온",
                 "delivery_ea": int(r["delivery_ea"]) if pd.notna(r["delivery_ea"]) else 0,
-                "safety_ea": int(r["safety_ea"]) if pd.notna(r["safety_ea"]) else 0,
                 "memo": "" if pd.isna(r["memo"]) else str(r["memo"]),
             }
             if pd.notna(rid) and int(rid) in old_map:  # 기존 행 수정
