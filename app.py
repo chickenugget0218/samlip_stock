@@ -693,6 +693,43 @@ elif page == "📝 일일 기록":
     if prods.empty:
         st.warning("먼저 [제품 관리]에서 제품을 등록하세요.")
     else:
+        # ── ♻️ 오늘 출고한 제품 재입고 (나갔다 다시 들어온 경우) ──
+        _today = TODAY()
+        _outs = qdf("""SELECT t.id, p.name AS 제품명, t.qty_box AS 박스, t.qty_ea AS 낱개,
+                              t.expiry_date AS 소비기한, t.product_id, p.box_qty,
+                              COALESCE(s.name, CASE WHEN t.region<>'' THEN '('||t.region||' 전체)' ELSE '(총량)' END) AS 매장
+                       FROM transactions t JOIN products p ON p.id=t.product_id
+                       LEFT JOIN stores s ON s.id=t.store_id
+                       WHERE t.ttype='출고' AND t.tdate=:d ORDER BY t.id DESC""", d=_today)
+        if not _outs.empty:
+            with st.expander(f"♻️ 오늘 출고한 제품 재입고 ({len(_outs)}건) — 나갔다 다시 들어온 경우", expanded=False):
+                st.caption("당일 출고했다가 되돌아온 물건을 원래 소비기한 그대로 다시 넣습니다. "
+                           "소비기한이 같아 로트가 쪼개지지 않고 합쳐집니다.")
+                for _, orow in _outs.iterrows():
+                    bq = bq_of(orow["box_qty"])
+                    conv = int(orow["박스"]) * bq + int(orow["낱개"])
+                    ex_disp = orow["소비기한"] if str(orow["소비기한"]).strip() else "기한없음"
+                    cc1, cc2, cc3 = st.columns([3, 2, 1.3])
+                    cc1.markdown(f"**{orow['제품명']}** · {orow['매장']}")
+                    cc2.caption(f"출고 {int(orow['박스'])}박스 {int(orow['낱개'])}낱개 (환산 {conv}) · 기한 {ex_disp}")
+                    as_type = cc3.selectbox("구분", ["반품", "입고"], key=f"reint_type_{orow['id']}",
+                                            label_visibility="collapsed")
+                    if cc3.button("♻️ 재입고", key=f"reint_{orow['id']}"):
+                        pid = int(orow["product_id"])
+                        ex = str(orow["소비기한"] or "")
+                        ops = [(
+                            "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, region, expiry_date, memo, created_at) "
+                            "VALUES (:d,:p,:t,NULL,:qb,:qe,'',:ex,:m,:c)",
+                            dict(d=_today, p=pid, t=as_type, qb=int(orow["박스"]), qe=int(orow["낱개"]),
+                                 ex=ex, m=f"당일 출고분 재입고(#{int(orow['id'])})", c=KST_NOW()))]
+                        ops += lot_add(pid, ex, conv, _today, collect=True)
+                        ops.append(log_op(str(orow["제품명"]), as_type, "",
+                                          f"당일 출고분 재입고 환산 {conv}낱개 · 기한 {ex_disp}"))
+                        run_batch(ops)
+                        clear_cache()
+                        st.success(f"✅ {orow['제품명']} {conv}낱개 재입고 완료 (기한 {ex_disp}) — 로트에 합쳐졌습니다.")
+                        st.rerun()
+
         mode_daily = st.radio(
             "입력 방식",
             ["1️⃣ 단일 입력 (실시간 환산 표시)", "🧾 여러 제품 일괄 입력 (엑셀형 · 발주서 CSV)"],
