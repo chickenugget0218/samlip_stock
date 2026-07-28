@@ -552,15 +552,15 @@ if page == "📊 대시보드":
                         styles = [base] * len(row)
                         # '현재잔여'는 기준 열 → 파란 강조로 덮어쓰기
                         ci = list(row.index).index("현재잔여")
-                        styles[ci] = "background-color: #1E88E5; color: #ffffff; font-weight: 800;"
+                        styles[ci] = "background-color: #FFD600; color: #000000; font-weight: 800;"
                         return styles
                     raw_view = search_box(raw, "search_raw_exp", "🔍 제품명 검색")
                     styled = (raw_view.style.apply(_hl_raw, axis=1)
                               .set_properties(subset=["현재잔여"],
-                                              **{"background-color": "#1565C0", "color": "white",
+                                              **{"background-color": "#FFD600", "color": "black",
                                                  "font-weight": "800"}))
                     st.dataframe(styled, use_container_width=True, hide_index=True,
-                                 column_config={"현재잔여": st.column_config.NumberColumn("🔵 현재잔여")})
+                                 column_config={"현재잔여": st.column_config.NumberColumn("🟡 현재잔여")})
                     tot = raw_view.groupby("제품명", as_index=False).agg(
                         입고합=("환산낱개", "sum"), 잔여합=("현재잔여", "sum"))
                     manual_note = ""
@@ -606,7 +606,7 @@ if page == "📊 대시보드":
                 show = search_box(show, "search_expiry", "🔍 제품명 검색")
                 _st2 = (show.style.apply(_hl_exp, axis=1)
                         .set_properties(subset=["잔여낱개환산"],
-                                        **{"background-color": "#1565C0", "color": "white",
+                                        **{"background-color": "#FFD600", "color": "black",
                                            "font-weight": "800"}))
                 st.dataframe(_st2, use_container_width=True, hide_index=True)
                 if pick_p != "(전체)":
@@ -1201,9 +1201,12 @@ elif page == "📦 재고 현황":
             v = v[["name", "barcode", "box_qty", "storage", "현재고", "박스환산"]]
             v.columns = ["제품명", "바코드", "박스입수량", "보관", "현재고(낱개환산)", "박스환산(자동)"]
             v = search_box(v, "stk_search", "🔍 제품 검색")
-            st.dataframe(v, use_container_width=True, hide_index=True,
+            _vst = v.style.set_properties(subset=["현재고(낱개환산)"],
+                                          **{"background-color": "#FFD600", "color": "black",
+                                             "font-weight": "800"})
+            st.dataframe(_vst, use_container_width=True, hide_index=True,
                          column_config={"현재고(낱개환산)": st.column_config.NumberColumn(
-                             "🔵 현재고(낱개환산)")})
+                             "🟡 현재고(낱개환산)")})
             csv_button(v, "재고현황", "csv_stock_now")
 
         with tab_e:
