@@ -63,9 +63,28 @@ if not hasattr(_core, "LOGIC_VERSION") or not hasattr(_core, "fmt_stock_ea"):
     st.stop()
 
 if not st.session_state.get("snapshot_done"):
+    import time as _time
+    _t0 = _time.time()
     migrate_to_lots_once()   # 기존 재고/거래 → 로트 1회 이관
+    _t1 = _time.time()
     snapshot_today()
+    _t2 = _time.time()
+    # DB 왕복 1회 순수 측정 (제품 조회)
+    _t3 = _time.time()
+    try:
+        _ = df_products()
+    except Exception:
+        pass
+    _t4 = _time.time()
+    st.session_state["_perf_first_load"] = {
+        "마이그레이션(1회성)": round(_t1 - _t0, 2),
+        "스냅샷저장": round(_t2 - _t1, 2),
+        "제품조회(DB왕복1회)": round(_t4 - _t3, 3),
+    }
     st.session_state["snapshot_done"] = True
+
+# ── 성능 측정 패널 (사이드바) ──
+_PERF_ON = st.query_params.get("perf") == "1"
 
 @st.dialog("📆 날짜별 기록 관리", width="large")
 def open_day_dialog(dsel: str):
@@ -380,6 +399,31 @@ page = _SETTINGS[_set_label] if _set_label != "(선택 안 함)" else _MAIN[_mai
 
 st.sidebar.divider()
 st.sidebar.caption("① 오늘 할 일 → 달력에서 교체·발주 확인\n\n② 입출고 → 입고·출고·반품(제품 교체) 기록·수정\n\n③ 재고 현황 → 지금 남은 재고·소비기한\n\n④ 메모 → 일자별 업무 메모")
+
+# ── 성능 측정 패널: 주소 뒤에 ?perf=1 붙이면 표시 ──
+if _PERF_ON:
+    with st.sidebar.expander("⏱️ 속도 측정", expanded=True):
+        fl = st.session_state.get("_perf_first_load", {})
+        if fl:
+            st.caption("**첫 로딩(이번 세션)**")
+            for k, v in fl.items():
+                st.write(f"- {k}: **{v}초**")
+        sv = st.session_state.get("_perf_last_save")
+        if sv:
+            st.caption("**최근 저장**")
+            st.write(f"- {sv['건수']}건 저장: **{sv['소요']}초** "
+                     f"(기록 {sv['기록']}s + 로트 {sv['로트']}s)")
+        # 즉석 DB 왕복 측정
+        if st.button("🔄 지금 DB 왕복 측정", key="perf_ping"):
+            import time as _tm
+            _a = _tm.time()
+            try:
+                _ = qdf("SELECT 1 AS x")
+            except Exception:
+                pass
+            _b = _tm.time()
+            st.write(f"→ DB 왕복 1회: **{round((_b - _a) * 1000)}ms**")
+        st.caption("측정 끄려면 주소에서 ?perf=1 제거")
 
 
 # ══════════════════════════════════════════════
@@ -815,12 +859,22 @@ elif page == "📝 일일 기록":
                                     lot_ops.append((pid, ex, conv))
                                 elif r["구분"] == "출고":
                                     lot_ops.append((pid, ex, -conv))
+                            import time as _tm
+                            _sa = _tm.time()
                             run_batch(ops)
+                            _sb = _tm.time()
                             for _pid, _ex, _q in lot_ops:
                                 if _q > 0:
                                     lot_add(_pid, _ex, _q, bdate.strftime("%Y-%m-%d"))
                                 elif _q < 0:
                                     lot_consume(_pid, -_q, _ex)
+                            _sc = _tm.time()
+                            st.session_state["_perf_last_save"] = {
+                                "건수": len(valid),
+                                "소요": round(_sc - _sa, 2),
+                                "기록": round(_sb - _sa, 2),
+                                "로트": round(_sc - _sb, 2),
+                            }
                             st.session_state["_bulk_last_fp"] = _fp   # 저장 지문 기록
                             clear_cache("daily_bulk_editor")          # 표 초기화 (같은 내용 재저장 방지)
                             st.success(f"✅ {bdate.strftime('%Y-%m-%d')} · {len(valid)}건 일괄 저장 완료")
