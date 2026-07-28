@@ -1077,6 +1077,56 @@ def build_calendar_html(year: int, month: int, events: dict) -> str:
             f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
 
 
+def rebuild_lots_for_product(pid: int, collect: bool = False):
+    """한 제품의 로트를 거래 기록으로부터 통째로 재계산.
+    입고·반품은 소비기한별로 합산(+), 출고는 지정기한 우선·미지정 FEFO로 차감(-).
+    → 수정으로 로트가 쪼개지거나 어긋나는 문제를 원천 차단 (거래가 유일한 진실)."""
+    bqrow = qdf("SELECT box_qty FROM products WHERE id=:p", p=pid)
+    bq = bq_of(bqrow.iloc[0]["box_qty"]) if not bqrow.empty else 1
+    ops = [("DELETE FROM lots WHERE product_id=:p", {"p": pid})]
+
+    # 1) 입고·반품: 소비기한별 합산 (+), 입고일은 그 기한의 최초 거래일
+    ins = qdf("""SELECT expiry_date AS e, MIN(tdate) AS d,
+                        SUM(qty_box*:bq + qty_ea) AS q
+                 FROM transactions
+                 WHERE product_id=:p AND ttype IN ('입고','반품')
+                 GROUP BY expiry_date""", bq=bq, p=pid)
+    lot_qty = {}   # expiry -> qty
+    lot_date = {}  # expiry -> in_date
+    for _, r in ins.iterrows():
+        e = str(r["e"] or "")
+        lot_qty[e] = lot_qty.get(e, 0) + int(r["q"])
+        lot_date[e] = str(r["d"] or TODAY())
+
+    # 2) 출고: 지정기한 먼저 그 로트에서, 미지정/부족분은 FEFO(짧은 기한부터)
+    outs = qdf("""SELECT expiry_date AS e, SUM(qty_box*:bq + qty_ea) AS q
+                  FROM transactions WHERE product_id=:p AND ttype='출고'
+                  GROUP BY expiry_date""", bq=bq, p=pid)
+    plain_out = 0
+    for _, r in outs.iterrows():
+        e = str(r["e"] or ""); q = int(r["q"])
+        if e and e in lot_qty:
+            take = min(lot_qty[e], q); lot_qty[e] -= take; q -= take
+        plain_out += q   # 지정기한 없거나 초과분 → FEFO 풀로
+    # FEFO 차감 (기한 오름차순, 기한없음='9999...' 맨 뒤)
+    for e in sorted(lot_qty.keys(), key=lambda x: x if x else "9999-99-99"):
+        if plain_out <= 0:
+            break
+        take = min(lot_qty[e], plain_out)
+        lot_qty[e] -= take; plain_out -= take
+
+    # 3) 남은 로트만 INSERT (0 이하 제외)
+    for e, q in lot_qty.items():
+        if q > 0:
+            ops.append(("INSERT INTO lots (product_id, expiry_date, in_date, qty_ea, updated_at) "
+                        "VALUES (:p, :e, :d, :q, :u)",
+                        dict(p=pid, e=e, d=lot_date.get(e, TODAY()), q=q, u=KST_NOW())))
+    if collect:
+        return ops
+    run_batch(ops)
+    return []
+
+
 def migrate_to_lots_once():
     """기존 데이터 → lots 이관 (최초 1회). 입고 기록의 소비기한별 로트 생성 후,
     총출고를 FEFO로 차감하고, 남는 현재고 차이는 (기한없음) 로트로 보정."""

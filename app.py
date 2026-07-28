@@ -787,7 +787,7 @@ elif page == "📝 일일 기록":
                 bulk_empty, num_rows="dynamic", hide_index=True, use_container_width=True,
                 column_config={
                     "제품명": st.column_config.SelectboxColumn("제품명", options=prods["name"].tolist(), required=True),
-                    "구분": st.column_config.SelectboxColumn("구분", options=TTYPE_OPTIONS, default="발주"),
+                    "구분": st.column_config.SelectboxColumn("구분", options=TTYPE_OPTIONS, default="입고"),
                     "매장": st.column_config.SelectboxColumn("매장(납품처)", options=store_opts, default="(총량 / 매장 미지정)"),
                     "박스": st.column_config.NumberColumn("수량(박스)", min_value=0, step=1, default=0),
                     "낱개": st.column_config.NumberColumn("수량(낱개)", min_value=0, step=1, default=0),
@@ -965,6 +965,7 @@ elif page == "📝 일일 기록":
 
                     old_map = {int(r["id"]): r for _, r in fix_view.iterrows()}
                     ops, lot_ops, n_fix = [], [], 0
+                    _touched_pids = set()
                     for _, r in fixed.iterrows():
                         rid = int(r["id"]); old = old_map.get(rid)
                         if old is None:
@@ -987,11 +988,8 @@ elif page == "📝 일일 기록":
                             if not dup.empty and int(dup.iloc[0]["n"]) > 0:
                                 st.info(f"ℹ️ #{rid}: 같은 날짜·제품·구분·소비기한의 다른 기록이 이미 있습니다. "
                                         "필요하면 그 기록과 합치거나 하나를 삭제하세요.")
-                            # 재고 재반영: 옛 효과 되돌리고(로트) 새 효과 적용
-                            old_conv = int(old["박스"]) * bq + int(old["낱개"])
-                            new_conv = new_qb * bq + new_qe
-                            lot_ops.append((pid, old_e, -_eff2(tt, old_conv)))   # 되돌림
-                            lot_ops.append((pid, new_e, _eff2(tt, new_conv)))    # 새 적용
+                            # 재고는 아래에서 rebuild_lots_for_product로 통째 재계산 (쪼개짐 방지)
+                            _touched_pids.add(pid)
                             ops.append(("UPDATE transactions SET tdate=:d, qty_box=:qb, qty_ea=:qe, "
                                         "expiry_date=:e, memo=:m WHERE id=:i",
                                         dict(d=new_d, qb=new_qb, qe=new_qe, e=new_e, m=new_m, i=rid)))
@@ -1002,16 +1000,13 @@ elif page == "📝 일일 기록":
                     if n_fix == 0:
                         st.info("변경된 내용이 없습니다.")
                     else:
-                        lot_sql = []
-                        for _pid, _ex, _q in lot_ops:
-                            if _q > 0:
-                                lot_sql += lot_add(_pid, _ex, _q, collect=True)
-                            elif _q < 0:
-                                lot_sql += lot_consume(_pid, -_q, _ex, collect=True)
-                        run_batch(ops + lot_sql)
+                        # 1) 거래 UPDATE 먼저 실행 → 2) 영향받은 제품의 로트를 거래로부터 재구성
+                        run_batch(ops)
+                        for _pid in _touched_pids:
+                            rebuild_lots_for_product(_pid)
                         clear_cache("fix_tx_editor")
                         st.session_state["_fix_last_fp"] = _fixfp   # 저장 지문 기록 (중복 방지)
-                        st.success(f"✅ {n_fix}건 수정 완료 — 재고에 즉시 반영됩니다.")
+                        st.success(f"✅ {n_fix}건 수정 완료 — 재고를 거래 기록 기준으로 재계산했습니다.")
                         st.rerun()
         tx = df_transactions()
         if tx.empty:
@@ -1367,28 +1362,46 @@ elif page == "📦 제품 관리(엑셀표)":
                 def _d(v):
                     return "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d")
                 omap = {int(r["id"]): r for _, r in lv.iterrows()}
-                ops, n = [], 0
+                ops, n, merged = [], 0, 0
                 for _, r in ed.iterrows():
                     rid = int(r["id"]); o = omap.get(rid)
                     if o is None:
                         continue
                     ne, ie, qq = _d(r["소비기한"]), _d(r["입고일"]), int(r["잔여낱개"] or 0)
                     if (str(o["소비기한"] or ""), str(o["입고일"] or ""), int(o["잔여낱개"])) != (ne, ie, qq):
+                        pidv = int(o["pid"]) if "pid" in o else int(o["product_id"]) if "product_id" in o else None
                         if qq <= 0:
                             ops.append(("DELETE FROM lots WHERE id=:i", {"i": rid}))
                         else:
-                            ops.append(("UPDATE lots SET expiry_date=:e, in_date=:d, qty_ea=:q, updated_at=:u WHERE id=:i",
-                                        dict(e=ne, d=ie, q=qq, u=KST_NOW(), i=rid)))
-                        add_log(str(o["제품명"]), "로트수정",
-                                f"기한 {o['소비기한'] or '없음'} / {int(o['잔여낱개'])}낱개",
-                                f"기한 {ne or '없음'} / {qq}낱개")
+                            # 소비기한을 바꿨는데 같은 제품에 그 기한 로트가 이미 있으면 → 병합
+                            dup_id = None
+                            if pidv is not None and ne != str(o["소비기한"] or ""):
+                                dup = qdf("SELECT id FROM lots WHERE product_id=:p AND expiry_date=:e AND id<>:i",
+                                          p=pidv, e=ne, i=rid)
+                                if not dup.empty:
+                                    dup_id = int(dup.iloc[0]["id"])
+                            if dup_id is not None:
+                                # 기존 로트에 수량 합치고, 이 로트는 삭제 (중복 로트 방지)
+                                ops.append(("UPDATE lots SET qty_ea = qty_ea + :q, updated_at=:u WHERE id=:t",
+                                            dict(q=qq, u=KST_NOW(), t=dup_id)))
+                                ops.append(("DELETE FROM lots WHERE id=:i", {"i": rid}))
+                                merged += 1
+                            else:
+                                ops.append(("UPDATE lots SET expiry_date=:e, in_date=:d, qty_ea=:q, updated_at=:u WHERE id=:i",
+                                            dict(e=ne, d=ie, q=qq, u=KST_NOW(), i=rid)))
+                        ops.append(log_op(str(o["제품명"]), "로트수정",
+                                          f"기한 {o['소비기한'] or '없음'} / {int(o['잔여낱개'])}낱개",
+                                          f"기한 {ne or '없음'} / {qq}낱개"))
                         n += 1
                 if n == 0:
                     st.info("변경된 내용이 없습니다.")
                 else:
                     run_batch(ops)
                     clear_cache("lot_editor")
-                    st.success(f"✅ 로트 {n}건 반영 완료 — 재고에 즉시 반영됩니다.")
+                    msg = f"✅ 로트 {n}건 반영 완료 — 재고에 즉시 반영됩니다."
+                    if merged:
+                        msg += f" (같은 소비기한 로트 {merged}건은 자동 합침)"
+                    st.success(msg)
                     st.rerun()
 
     # ── 제품 상세: 이미지 / 구성품 / 납품처 ──
