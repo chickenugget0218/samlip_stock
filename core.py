@@ -464,12 +464,15 @@ def stock_of(pid: int = None) -> dict:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def expiry_breakdown() -> pd.DataFrame:
-    """소비기한별 잔여 = 로트 그대로. (재고 = 로트 합계이므로 항상 일치)"""
+    """소비기한별 잔여 = 로트를 제품+소비기한으로 합산 (쪼개진 로트도 한 줄로)."""
     lots = df_lots()
     if lots.empty:
         return pd.DataFrame()
+    # 제품+소비기한으로 합산 → 같은 조합이 여러 로트여도 한 줄
+    g = lots.groupby(["제품명", "소비기한"], as_index=False).agg(
+        잔여낱개=("잔여낱개", "sum"), box_qty=("box_qty", "max"))
     rows = []
-    for _, r in lots.iterrows():
+    for _, r in g.iterrows():
         bq = bq_of(r["box_qty"])
         left = int(r["잔여낱개"])
         exp = r["소비기한"] or "(기한없음)"
