@@ -260,12 +260,13 @@ def open_day_dialog(dsel: str):
         if n_chg == 0:
             st.info("변경된 내용이 없습니다.")
         else:
-            run_batch(ops)
+            lot_sql = []
             for _pid, _ex, _q in lot_ops:      # 로트 반영 (재고 = 로트 합계)
                 if _q > 0:
-                    lot_add(_pid, _ex, _q, dsel)
+                    lot_sql += lot_add(_pid, _ex, _q, dsel, collect=True)
                 elif _q < 0:
-                    lot_consume(_pid, -_q, _ex)
+                    lot_sql += lot_consume(_pid, -_q, _ex, collect=True)
+            run_batch(ops + lot_sql)   # 기록 + 로트를 한 번에
             clear_cache(f"day_editor_{dsel}")
             st.success(f"✅ {dsel} · {n_chg}건 반영 완료")
             st.rerun()
@@ -744,14 +745,14 @@ elif page == "📝 일일 기록":
                              ex=exp_date.strftime("%Y-%m-%d") if exp_use else "",
                              m=memo, c=KST_NOW()))]
                     if ttype in ("입고", "출고", "반품"):
-                        run_batch(ops)  # 거래 이력 저장
                         ex_str = exp_date.strftime("%Y-%m-%d") if exp_use else ""
                         if ttype in ("입고", "반품"):   # 반품도 재고 +
-                            lot_add(pid, ex_str, int(conv), tdate.strftime("%Y-%m-%d"))
+                            ops += lot_add(pid, ex_str, int(conv), tdate.strftime("%Y-%m-%d"), collect=True)
                         else:
-                            lot_consume(pid, int(conv), ex_str)
-                        add_log(pname, "재고(로트)", "", f"{ttype} 환산 {conv}낱개"
-                                + (f" · 기한 {ex_str}" if ex_str else " · 기한없음(FEFO)"))
+                            ops += lot_consume(pid, int(conv), ex_str, collect=True)
+                        ops.append(log_op(pname, "재고(로트)", "", f"{ttype} 환산 {conv}낱개"
+                                          + (f" · 기한 {ex_str}" if ex_str else " · 기한없음(FEFO)")))
+                        run_batch(ops)   # 기록 + 로트 + 로그를 한 번에
                     else:
                         run_batch(ops)
                     clear_cache()
@@ -861,19 +862,20 @@ elif page == "📝 일일 기록":
                                     lot_ops.append((pid, ex, -conv))
                             import time as _tm
                             _sa = _tm.time()
-                            run_batch(ops)
-                            _sb = _tm.time()
+                            # 로트 연산까지 모아서 한 트랜잭션으로 (왕복 최소화)
+                            lot_sql = []
                             for _pid, _ex, _q in lot_ops:
                                 if _q > 0:
-                                    lot_add(_pid, _ex, _q, bdate.strftime("%Y-%m-%d"))
+                                    lot_sql += lot_add(_pid, _ex, _q, bdate.strftime("%Y-%m-%d"), collect=True)
                                 elif _q < 0:
-                                    lot_consume(_pid, -_q, _ex)
+                                    lot_sql += lot_consume(_pid, -_q, _ex, collect=True)
+                            run_batch(ops + lot_sql)   # 기록 + 로트를 한 번에
                             _sc = _tm.time()
                             st.session_state["_perf_last_save"] = {
                                 "건수": len(valid),
                                 "소요": round(_sc - _sa, 2),
-                                "기록": round(_sb - _sa, 2),
-                                "로트": round(_sc - _sb, 2),
+                                "기록": round(_sc - _sa, 2),
+                                "로트": 0.0,
                             }
                             st.session_state["_bulk_last_fp"] = _fp   # 저장 지문 기록
                             clear_cache("daily_bulk_editor")          # 표 초기화 (같은 내용 재저장 방지)
@@ -995,12 +997,13 @@ elif page == "📝 일일 기록":
                     if n_fix == 0:
                         st.info("변경된 내용이 없습니다.")
                     else:
-                        run_batch(ops)
+                        lot_sql = []
                         for _pid, _ex, _q in lot_ops:
                             if _q > 0:
-                                lot_add(_pid, _ex, _q)
+                                lot_sql += lot_add(_pid, _ex, _q, collect=True)
                             elif _q < 0:
-                                lot_consume(_pid, -_q, _ex)
+                                lot_sql += lot_consume(_pid, -_q, _ex, collect=True)
+                        run_batch(ops + lot_sql)
                         clear_cache("fix_tx_editor")
                         st.session_state["_fix_last_fp"] = _fixfp   # 저장 지문 기록 (중복 방지)
                         st.success(f"✅ {n_fix}건 수정 완료 — 재고에 즉시 반영됩니다.")

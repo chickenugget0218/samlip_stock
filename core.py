@@ -394,16 +394,21 @@ def manual_diffs() -> pd.DataFrame:
 # ──────────────────────────────────────────────
 # 로트 엔진 (lots = 재고의 유일한 진실)
 # ──────────────────────────────────────────────
-def lot_add(pid: int, expiry: str, qty_ea: int, in_date: str = ""):
-    """입고: 제품+소비기한 로트에 수량 합산 (없으면 생성)."""
-    run("""INSERT INTO lots (product_id, expiry_date, in_date, qty_ea, updated_at)
+def lot_add(pid: int, expiry: str, qty_ea: int, in_date: str = "", collect: bool = False):
+    """입고: 제품+소비기한 로트에 수량 합산 (없으면 생성).
+    collect=True면 실행 대신 (sql, params) 리스트를 반환 → 여러 건을 한 트랜잭션으로 묶기 위함."""
+    op = ("""INSERT INTO lots (product_id, expiry_date, in_date, qty_ea, updated_at)
            VALUES (:p, :e, :d, :q, :u)
            ON CONFLICT (product_id, expiry_date)
            DO UPDATE SET qty_ea = lots.qty_ea + :q, in_date = :d, updated_at = :u""",
-        p=pid, e=expiry or "", d=in_date or TODAY(), q=int(qty_ea), u=KST_NOW())
+          dict(p=pid, e=expiry or "", d=in_date or TODAY(), q=int(qty_ea), u=KST_NOW()))
+    if collect:
+        return [op]
+    run(op[0], **op[1])
+    return []
 
 
-def lot_consume(pid: int, qty_ea: int, expiry: str = ""):
+def lot_consume(pid: int, qty_ea: int, expiry: str = "", collect: bool = False):
     """출고: expiry 지정 시 그 로트에서, 미지정 시 소비기한 짧은 것부터(FEFO) 차감.
     부족하면 가능한 만큼만 빼고 음수로 만들지 않음(로트는 0 이상 유지)."""
     need = int(qty_ea)
@@ -425,8 +430,11 @@ def lot_consume(pid: int, qty_ea: int, expiry: str = ""):
             ops.append(("UPDATE lots SET qty_ea = qty_ea - :t, updated_at=:u WHERE id=:i",
                         dict(t=take, u=KST_NOW(), i=int(r["id"]))))
             need -= take
+    if collect:
+        return ops
     if ops:
         run_batch(ops)
+    return []
 
 
 @st.cache_data(ttl=60, show_spinner=False)
