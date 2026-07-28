@@ -56,9 +56,14 @@ for _name in dir(_core):
     if not _name.startswith("_"):
         _g[_name] = getattr(_core, _name)
 
-# 버전 확인 (구버전 core 감지)
-if not hasattr(_core, "LOGIC_VERSION") or not hasattr(_core, "fmt_stock_ea"):
-    st.error("⚠️ core.py 가 예전 버전입니다. 저장소 루트의 core.py 를 이번 최신 파일로 교체 후 다시 배포하세요.")
+# 버전 확인 (구버전 core 감지) — collect 옵션까지 확인
+import inspect as _inspect
+_core_ok = (hasattr(_core, "LOGIC_VERSION") and hasattr(_core, "fmt_stock_ea")
+            and hasattr(_core, "lot_add")
+            and "collect" in _inspect.signature(_core.lot_add).parameters)
+if not _core_ok:
+    st.error("⚠️ core.py 가 예전 버전입니다. **app.py 와 core.py 를 반드시 함께** 최신으로 올린 뒤 "
+             "⋮ → Reboot app 하세요. (한쪽만 올리면 이 오류가 납니다)")
     st.info(f"현재 불러온 core.py 위치: {getattr(_core, '__file__', '알 수 없음')}")
     st.stop()
 
