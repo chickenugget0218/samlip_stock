@@ -87,6 +87,14 @@ def open_day_dialog(dsel: str):
                                       int(get_setting("cutoff_days", "2")),
                                       get_setting("cutoff_time", "11:30"))
         if not _sched.empty:
+            # 🔄 오늘 교체(매장에 새 제품 넣는 날) — _L = 마지막 교체 납품일
+            if "_L" in _sched.columns:
+                repl = _sched[_sched["_L"].astype(str) == dsel]
+                if not repl.empty:
+                    items = []
+                    for _, rr in repl.iterrows():
+                        items.append(f"{rr['제품명']}→{rr['매장']}(기한 {rr['소비기한']})")
+                    lines.append("🔄 오늘 교체: " + ", ".join(items[:8]))
             cut = _sched[_sched["_cutoff"].astype(str).str[:10] == dsel]
             if not cut.empty:
                 lines.append("🧾 발주마감: " + ", ".join(cut["제품명"].unique()[:6]))
@@ -97,6 +105,17 @@ def open_day_dialog(dsel: str):
         pass
     if lines:
         st.info(" · ".join(lines))
+
+    # 🔄 교체 대상 강조 박스 (그날 교체할 제품이 있으면 눈에 띄게)
+    try:
+        if "_sched" in dir() and _sched is not None and not _sched.empty and "_L" in _sched.columns:
+            repl2 = _sched[_sched["_L"].astype(str) == dsel]
+            if not repl2.empty:
+                st.warning("🔄 **오늘 교체할 제품** — 매장에서 빼고 새 제품으로 교체하세요:")
+                show = repl2[["제품명", "매장", "소비기한", "발주마감", "상태"]].copy()
+                st.dataframe(show, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
 
     prods = df_products()
     stores = df_stores()
@@ -766,35 +785,46 @@ elif page == "📝 일일 기록":
                     if not bad.empty:
                         st.error(f"수량이 0인 행이 {len(bad)}건 있습니다. 박스 또는 낱개를 입력하세요.")
                     else:
-                        prow_map = {r["name"]: r for _, r in prods.iterrows()}
-                        ops = []
-                        lot_ops = []  # (pid, expiry, qty_signed)
-                        for _, r in valid.iterrows():
-                            pr = prow_map[r["제품명"]]
-                            pid = int(pr["id"])
-                            sid, region = parse_store_choice(str(r["매장"]), stores)
-                            ex = "" if pd.isna(r["소비기한"]) else pd.Timestamp(r["소비기한"]).strftime("%Y-%m-%d")
-                            bq = bq_of(pr["box_qty"])
-                            conv = int(r["박스"]) * bq + int(r["낱개"])
-                            ops.append((
-                                "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, region, expiry_date, memo, created_at) "
-                                "VALUES (:d, :p, :t, :s, :qb, :qe, :rg, :ex, :m, :c)",
-                                dict(d=bdate.strftime("%Y-%m-%d"), p=pid, t=r["구분"],
-                                     s=sid, rg=region,
-                                     qb=int(r["박스"]), qe=int(r["낱개"]), ex=ex, m=r["메모"], c=KST_NOW())))
-                            if r["구분"] in ("입고", "반품"):
-                                lot_ops.append((pid, ex, conv))
-                            elif r["구분"] == "출고":
-                                lot_ops.append((pid, ex, -conv))
-                        run_batch(ops)
-                        for _pid, _ex, _q in lot_ops:
-                            if _q > 0:
-                                lot_add(_pid, _ex, _q, bdate.strftime("%Y-%m-%d"))
-                            elif _q < 0:
-                                lot_consume(_pid, -_q, _ex)
-                        clear_cache("daily_bulk_editor")
-                        st.success(f"✅ {bdate.strftime('%Y-%m-%d')} · {len(valid)}건 일괄 저장 완료")
-                        st.rerun()
+                        # 중복 저장 방지: 같은 내용(날짜+행들)의 지문을 만들어 직전 저장과 비교
+                        import hashlib as _hl
+                        _fp = _hl.md5(
+                            (bdate.strftime("%Y-%m-%d") + "|" +
+                             valid[["제품명", "구분", "매장", "박스", "낱개", "소비기한", "메모"]]
+                             .astype(str).to_csv(index=False)).encode("utf-8")).hexdigest()
+                        if st.session_state.get("_bulk_last_fp") == _fp:
+                            st.warning("⚠️ 방금 저장한 내용과 동일합니다. 중복 저장을 막았어요. "
+                                       "(다시 저장하려면 표를 새로 입력하세요)")
+                        else:
+                            prow_map = {r["name"]: r for _, r in prods.iterrows()}
+                            ops = []
+                            lot_ops = []  # (pid, expiry, qty_signed)
+                            for _, r in valid.iterrows():
+                                pr = prow_map[r["제품명"]]
+                                pid = int(pr["id"])
+                                sid, region = parse_store_choice(str(r["매장"]), stores)
+                                ex = "" if pd.isna(r["소비기한"]) else pd.Timestamp(r["소비기한"]).strftime("%Y-%m-%d")
+                                bq = bq_of(pr["box_qty"])
+                                conv = int(r["박스"]) * bq + int(r["낱개"])
+                                ops.append((
+                                    "INSERT INTO transactions (tdate, product_id, ttype, store_id, qty_box, qty_ea, region, expiry_date, memo, created_at) "
+                                    "VALUES (:d, :p, :t, :s, :qb, :qe, :rg, :ex, :m, :c)",
+                                    dict(d=bdate.strftime("%Y-%m-%d"), p=pid, t=r["구분"],
+                                         s=sid, rg=region,
+                                         qb=int(r["박스"]), qe=int(r["낱개"]), ex=ex, m=r["메모"], c=KST_NOW())))
+                                if r["구분"] in ("입고", "반품"):
+                                    lot_ops.append((pid, ex, conv))
+                                elif r["구분"] == "출고":
+                                    lot_ops.append((pid, ex, -conv))
+                            run_batch(ops)
+                            for _pid, _ex, _q in lot_ops:
+                                if _q > 0:
+                                    lot_add(_pid, _ex, _q, bdate.strftime("%Y-%m-%d"))
+                                elif _q < 0:
+                                    lot_consume(_pid, -_q, _ex)
+                            st.session_state["_bulk_last_fp"] = _fp   # 저장 지문 기록
+                            clear_cache("daily_bulk_editor")          # 표 초기화 (같은 내용 재저장 방지)
+                            st.success(f"✅ {bdate.strftime('%Y-%m-%d')} · {len(valid)}건 일괄 저장 완료")
+                            st.rerun()
 
         # ── 일일 기록 엑셀 내보내기 ──
         st.divider()
@@ -858,6 +888,14 @@ elif page == "📝 일일 기록":
                     }, key="fix_tx_editor")
 
                 if st.button("💾 수정 저장 (재고 자동 반영)", type="primary", use_container_width=True, key="fix_tx_save"):
+                    import hashlib as _hl
+                    _fixfp = _hl.md5(
+                        fixed[["id", "날짜", "박스", "낱개", "소비기한", "메모"]]
+                        .astype(str).to_csv(index=False).encode("utf-8")).hexdigest()
+                    if st.session_state.get("_fix_last_fp") == _fixfp:
+                        st.warning("⚠️ 방금 저장한 수정 내용과 동일합니다. 중복 저장(재고 이중 반영)을 막았어요.")
+                        st.stop()
+
                     def _dstr(v):
                         return "" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d")
 
@@ -880,6 +918,14 @@ elif page == "📝 일일 기록":
                                 new_d, new_e, new_m, new_qb, new_qe):
                             if not new_d:
                                 st.warning(f"#{rid}: 날짜는 비울 수 없어 건너뜀"); continue
+                            # 같은 날짜·제품·구분·소비기한의 다른 기록이 이미 있으면 안내(참고용, 저장은 진행)
+                            dup = qdf("""SELECT COUNT(*) AS n FROM transactions
+                                         WHERE id <> :i AND product_id = :p AND ttype = :t
+                                           AND tdate = :d AND expiry_date = :e""",
+                                      i=rid, p=pid, t=tt, d=new_d, e=new_e)
+                            if not dup.empty and int(dup.iloc[0]["n"]) > 0:
+                                st.info(f"ℹ️ #{rid}: 같은 날짜·제품·구분·소비기한의 다른 기록이 이미 있습니다. "
+                                        "필요하면 그 기록과 합치거나 하나를 삭제하세요.")
                             # 재고 재반영: 옛 효과 되돌리고(로트) 새 효과 적용
                             old_conv = int(old["박스"]) * bq + int(old["낱개"])
                             new_conv = new_qb * bq + new_qe
@@ -902,6 +948,7 @@ elif page == "📝 일일 기록":
                             elif _q < 0:
                                 lot_consume(_pid, -_q, _ex)
                         clear_cache("fix_tx_editor")
+                        st.session_state["_fix_last_fp"] = _fixfp   # 저장 지문 기록 (중복 방지)
                         st.success(f"✅ {n_fix}건 수정 완료 — 재고에 즉시 반영됩니다.")
                         st.rerun()
         tx = df_transactions()
@@ -914,8 +961,11 @@ elif page == "📝 일일 기록":
             del_id = st.selectbox(
                 "삭제할 기록 선택",
                 options=[0] + tx["id"].tolist(),
-                format_func=lambda i: "선택 안 함" if i == 0 else
-                f"#{i} | " + " | ".join(map(str, tx[tx['id'] == i][['날짜','제품명','구분','매장','박스','낱개']].iloc[0].tolist())),
+                format_func=lambda i: "선택 안 함" if i == 0 else (
+                    lambda r: f"#{i} | {r['날짜']} | {r['제품명']} | {r['구분']} | {r['매장']} | "
+                              f"{int(r['박스'])}박스 {int(r['낱개'])}낱개 | 기한 "
+                              f"{r['소비기한'] if str(r['소비기한']).strip() else '없음'}"
+                )(tx[tx['id'] == i].iloc[0]),
             )
             if del_id and st.button("🗑️ 선택 기록 삭제"):
                 row = qdf("SELECT product_id, ttype, qty_box, qty_ea, expiry_date FROM transactions WHERE id=:i", i=del_id)
